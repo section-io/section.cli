@@ -1,0 +1,329 @@
+#!/usr/bin/env ruby
+
+require 'net/http'
+require 'fileutils'
+require 'tempfile'
+require 'open-uri'
+require 'rubygems/package'
+require 'json'
+require 'open3'
+require 'logger'
+
+TAR_LONGLINK = '././@LongLink'
+
+VAGRANT_PATH = File.join(File.dirname(__FILE__), "vagrant")
+APPS_PATH = File.join(File.dirname(__FILE__), "apps")
+INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
+INSTANCE_CONFIG_FILE = File.join(VAGRANT_PATH, 'hiera', 'config.json')
+REPOSITORY_PATH_FILE = File.join(VAGRANT_PATH, 'hiera', 'repository_path')
+APP_ID_FILE = File.join(VAGRANT_PATH, 'hiera', 'app_id')
+REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
+APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
+SECTION_IO_THUMBPRINT_SHA1 = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
+
+@logger = Logger.new(STDERR)
+@logger.level = Logger::INFO #DEBUG
+@logger.formatter = proc do |severity, datetime, progname, msg|
+  "#{datetime} [#{severity}]: #{msg}\n"
+end
+
+def display_command_options()
+	puts "\n Options:\n"
+	puts "   * up <token> - Bring up a new section virtual machine for the specified instance token\n"
+	puts "   * reload - Reload varnish with your latest local changes\n"
+	puts "   * pull - Pull down any updates commited to your git repository\n"
+	puts "   * push <commit message> - Commit and push local changes to your git repository\n"
+	puts "   * promote - Merge Development into Production and push result to your git repository\n"
+	puts "   * --help - Display this help content\n"
+
+	puts "\n Documentation can be found at https://sectionio.zendesk.com/hc/en-us\n"
+	puts "\n Submit any support questions to https://sectionio.zendesk.com/hc/en-us/requests/new or support@section.io"
+end
+
+def get_instance_config(token)
+	uri = URI.parse("https://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
+	http = Net::HTTP.new(uri.host, uri.port)
+	http.use_ssl = true
+	http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+	http.verify_callback = lambda do |preverify_ok, ssl_context|
+		return OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s==SECTION_IO_THUMBPRINT_SHA1
+	end
+	config_str = http.get(uri).body
+	config = JSON.parse(config_str)
+	File.open(INSTANCE_CONFIG_FILE, 'w+') {|f| f.write(config_str) }
+	return config
+end
+
+# Cross-platform way of finding an executable in the $PATH.
+#  From: http://stackoverflow.com/a/5471032/20819
+#   which('ruby') #=> /usr/bin/ruby
+def which(cmd)
+  exts = ENV['PATHEXT'] ? ENV['PATHEXT'].split(';') : ['']
+  ENV['PATH'].split(File::PATH_SEPARATOR).each do |path|
+    exts.each { |ext|
+      exe = File.join(path, "#{cmd}#{ext}")
+      return exe if File.executable?(exe) && !File.directory?(exe)
+    }
+  end
+  return nil
+end
+
+def download_latest_vagrant_if_needed()
+
+	print "Downloading latest vagrant files to #{VAGRANT_PATH}\n"
+
+	uri = URI.parse("http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz")
+    filename = File.basename(uri.path)
+	download_file = File.join(File.dirname(__FILE__), filename)
+
+	destination = File.dirname(__FILE__)
+
+	source = open(uri)
+	Gem::Package::TarReader.new( Zlib::GzipReader.new(source) ) do |tar|
+	  dest = nil
+	  tar.each do |entry|
+	    if entry.full_name == TAR_LONGLINK
+	      dest = File.join destination, entry.read.strip
+	      next
+	    end
+	    dest ||= File.join destination, entry.full_name
+	    if entry.directory?
+	      FileUtils.rm_rf dest unless File.directory? dest
+	      FileUtils.mkdir_p dest, :mode => entry.header.mode, :verbose => false
+	    elsif entry.file?
+	      FileUtils.mkdir_p File.dirname(dest), :verbose => false
+	      FileUtils.rm_rf dest unless File.file? dest
+	      File.open dest, "wb" do |f|
+	        f.print entry.read
+	      end
+	      FileUtils.chmod entry.header.mode, dest, :verbose => false
+	    elsif entry.header.typeflag == '2' #Symlink!
+	      File.symlink entry.header.linkname, dest
+	    end
+	    dest = nil
+	  end
+	end
+end
+
+def update_app_repo_dir(config)
+
+	applicationConfig = config['accounts'][0]['applications'][0]
+	application_name = applicationConfig['name']
+	$stdout.write "Processing application: #{application_name}\n"
+	filefriendlyAppName = application_name.gsub(/[^a-z0-9_\.\-]+/,'').downcase
+	appDirectory = File.join(APPS_PATH, filefriendlyAppName)
+
+
+	if Dir.exists?(appDirectory)
+		#Leave it in intact
+		$stdout.write "Repository exists and will not be altered\n"
+	else
+		$stdout.write "Creating repository\n"
+		FileUtils.mkdir_p appDirectory
+		gitCmd = "git clone \"#{applicationConfig['repository']}\" #{appDirectory} --branch Development"
+		puts("[.] #{gitCmd}")
+		system(gitCmd, :chdir => APPS_PATH)
+	end
+
+	File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
+	File.open(APP_ID_FILE, 'w+') {|f| f.write(applicationConfig['application_id']) } #Write the current app id
+
+	File.open("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}", 'w+') {|f| f.write(appDirectory) } #Write the path to the repository here
+
+end
+
+def copy_app_repo_to_hiera()
+	#sync apps\friendlyname to C:\squixa\section.cli\vagrant\hiera\repos\<N>
+	source_dir = IO.read(REPOSITORY_PATH_FILE)
+	app_id = IO.read(APP_ID_FILE)
+
+	#id = /\.(?<id>\d+)$/.match(file)[1]
+	dest_dir = File.join(REPOSITORIES_DIR, app_id)
+	FileUtils.mkdir_p dest_dir
+	FileUtils.cp_r(File.join(source_dir, "."), dest_dir, :remove_destination=>true)
+end
+
+if ! which('vagrant')
+	puts 'Vagrant must be installed and on the PATH. Vagrant can be downloaded at https://www.vagrantup.com/'
+	exit 1
+end
+
+# TODO move all this SSH path finding logic into its own function
+vagrant_env_path = ENV['path'].dup
+if ! which('ssh')
+	# check for ssh in git directory for Windows
+	git_executable_path = which('git')
+	if git_executable_path
+		try_ssh_directory_path = File.dirname(git_executable_path)
+		if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
+			vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
+		else
+			try_ssh_directory_path = File.join(File.dirname(git_executable_path), '..', 'bin')
+			if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
+				vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
+			else
+				puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
+				exit 1
+			end
+		end
+	else
+		puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
+		exit 1
+	end
+end
+
+# TODO report all missing dependencies before exiting for a better user experience
+
+# TODO test for VirtualBox installation
+# TODO test for Git installation
+
+def section_init()
+	#TODO: Allow a command line arg to force a reload
+	#if not File.directory?(VAGRANT_PATH)
+		download_latest_vagrant_if_needed()
+	#end
+
+	if ARGV[1] != nil then
+		FileUtils.mkdir_p File.join(VAGRANT_PATH, 'hiera') #, :verbose => false
+		token = ARGV[1]
+
+		File.open(INSTANCE_TOKEN_FILE, 'w+') {|f| f.write(ARGV[1]) }
+	elsif File.exist?(INSTANCE_TOKEN_FILE) then
+		token = IO.read(INSTANCE_TOKEN_FILE)
+		print "Running with existing token '#{token}'\n"
+	else
+		$stderr.write "Error: Please provide your instance token as a parameter\n"
+		$stderr.write "ie. \n\tsection up <token>\n\n"
+		abort "You can obtain the instance token by logging in to aperture.section.io and selecting the instance you are trying to launch\n"
+	end
+
+	config = get_instance_config(token)
+	update_app_repo_dir(config)
+	copy_app_repo_to_hiera()
+end
+
+def cmd_execute(path, cmd)
+		Open3.popen3(cmd, :chdir=>path) {|stdin, stdout, stderr, wait_thr|
+			@logger.debug "Running [#{path}] #{cmd}"
+
+			exit_status = wait_thr.value # Process::Status object returned.
+			stdout_result = stdout.read.chomp
+			stderr_result = stderr.read.chomp
+
+			@logger.debug "exit_status: #{exit_status}"
+			@logger.debug "stdout: "+stdout_result
+			@logger.debug "stderr: "+stderr_result
+			return exit_status, stdout_result, stderr_result
+		}
+end
+
+def cmd_execute_interactive(path, cmd)
+	@logger.debug "Running [#{path}] #{cmd}"
+	return system(cmd, :chdir => path) 
+end
+
+
+def section_promote()
+	destination_branch='Production'
+
+	repo_path = IO.read(REPOSITORY_PATH_FILE)
+
+	#Get current branch name
+	original_branch = nil
+	exit_status, stdout, stderr = cmd_execute(repo_path, "git rev-parse --abbrev-ref HEAD")
+	exit_status==0 or abort 'Could\'t check for clean git working copy'
+	stdout.length!=0 or abort 'Couldn\'t determine current HEAD'
+	original_branch = stdout
+
+	#Set source branch name to current branch name 
+	source_branch=original_branch
+
+	#Check that there are no local changes
+	exit_status, stdout, stderr = cmd_execute(repo_path, "git status --porcelain")
+	exit_status==0 or abort 'Could\'t check for clean git working copy'
+	stdout.length==0 or abort '"section push" or discard changes before continuing.'
+
+	#Push current branch
+	cmd_execute_interactive(repo_path, "git push origin") or abort 'Failed to push current branch'
+
+	#Checkout destination branch
+	cmd_execute(repo_path, "git checkout #{destination_branch}") or abort "Couldn't checkout #{destination_branch}"
+
+	#Pull destination branch
+	cmd_execute_interactive(repo_path,"git pull") or abort "Couldn't update #{destination_branch}"
+
+	#Merge source branch into destination branch
+	cmd_execute(repo_path,"git merge --no-ff -m \"#{source_branch} merged to #{destination_branch}\" #{source_branch}") or exit
+
+	#Push destination branch
+	cmd_execute_interactive(repo_path, "git push") or exit
+
+	#Checkout original branch
+	cmd_execute(repo_path,"git checkout #{original_branch}") or exit
+
+end #section_promote
+
+
+case ARGV[0]
+when "init"
+
+	section_init
+
+when "up"
+
+	section_init
+
+	system("vagrant up", :chdir => VAGRANT_PATH)
+
+	system({ 'PATH' => vagrant_env_path }, 'vagrant', 'ssh', '-c', 'sudo /vagrant/bootstrap.sh;', :chdir => VAGRANT_PATH)
+
+when "reload"
+
+	copy_app_repo_to_hiera()
+	#Update hiera config
+	system("vagrant ssh -c 'sudo /vagrant/hiera/generate_hiera.sh;'", :chdir => VAGRANT_PATH)
+	#Reload containers to reflect the latest changes
+	system("vagrant ssh -c 'sudo /vagrant/run_puppet.sh;'", :chdir => VAGRANT_PATH)
+
+when "pull"
+
+	git_path = IO.read(REPOSITORY_PATH_FILE)
+	gitCmd = "git pull"
+	puts("[#{git_path}] #{gitCmd}")
+	system(gitCmd, :chdir => git_path)
+
+when 'push'
+
+	if ARGV[1] == nil or ARGV[1] == "" then
+		abort "*** Missing commit message ***\n\nUsage: \n\tsection push \"Commit message\""
+	end
+
+	commit_message = ARGV[1]
+	git_path = IO.read(REPOSITORY_PATH_FILE)
+
+	gitCmd = "git commit -am \"#{commit_message}\""
+
+	puts("[#{git_path}] #{gitCmd}")
+	system(gitCmd, :chdir => git_path)
+
+	gitCmd = "git push"
+	puts("[#{git_path}] #{gitCmd}")
+	system(gitCmd, :chdir => git_path)
+
+when 'promote'
+	section_promote
+
+when '--help'
+
+	display_command_options()
+
+when nil
+	puts "\nERROR: Missing command\n"
+	display_command_options()
+	exit 1
+
+else
+	puts "\nERROR: Invalid command '#{ARGV[0]}'"
+	display_command_options()
+	exit 1
+end
