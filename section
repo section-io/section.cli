@@ -11,8 +11,9 @@ require 'logger'
 
 TAR_LONGLINK = '././@LongLink'
 
-VAGRANT_PATH = File.join(File.dirname(__FILE__), "vagrant")
-APPS_PATH = File.join(File.dirname(__FILE__), "apps")
+SECTION_CLI_PATH = File.dirname(__FILE__)
+VAGRANT_PATH = File.join(SECTION_CLI_PATH, "vagrant")
+APPS_PATH = File.join(SECTION_CLI_PATH, "apps")
 INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
 INSTANCE_CONFIG_FILE = File.join(VAGRANT_PATH, 'hiera', 'config.json')
 REPOSITORY_PATH_FILE = File.join(VAGRANT_PATH, 'hiera', 'repository_path')
@@ -20,6 +21,9 @@ APP_ID_FILE = File.join(VAGRANT_PATH, 'hiera', 'app_id')
 REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
 APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
 SECTION_IO_THUMBPRINT_SHA1 = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
+SECTION_DATA_DIR = File.expand_path('~/.section')
+FileUtils.mkdir_p SECTION_DATA_DIR
+SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 
 @logger = Logger.new(STDERR)
 @logger.level = Logger::INFO #DEBUG
@@ -74,9 +78,9 @@ def download_latest_vagrant_if_needed()
 
 	uri = URI.parse("http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz")
     filename = File.basename(uri.path)
-	download_file = File.join(File.dirname(__FILE__), filename)
+	download_file = File.join(SECTION_CLI_PATH, filename)
 
-	destination = File.dirname(__FILE__)
+	destination = SECTION_CLI_PATH
 
 	source = open(uri)
 	Gem::Package::TarReader.new( Zlib::GzipReader.new(source) ) do |tar|
@@ -178,6 +182,16 @@ end
 # TODO test for Git installation
 
 def section_init()
+
+	# update section cli if not attempted for more than an hour, or if forced by environment variable
+	update_section_cli_now = !File.exists?(SECTION_CLI_UPDATE_FILE) || File.mtime(SECTION_CLI_UPDATE_FILE) < (Time.now - 60*60)
+	update_section_cli_now = (ENV['SECTION_CLI_UPDATE'] == 'true') if ENV['SECTION_CLI_UPDATE'] # force either on or off
+	if update_section_cli_now
+		exit_status, stdout, stderr = cmd_execute(SECTION_CLI_PATH, "git pull")
+		exit_status==0 or $stderr.write "Warning: could not check for update to latest version of section.cli\n"
+		FileUtils.touch SECTION_CLI_UPDATE_FILE
+	end
+
 	#TODO: Allow a command line arg to force a reload
 	#if not File.directory?(VAGRANT_PATH)
 		download_latest_vagrant_if_needed()
