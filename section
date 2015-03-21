@@ -192,8 +192,11 @@ end
 def section_init()
 
 	# update section cli if not attempted for more than an hour, or if forced by environment variable
+	@logger.debug "SECTION_CLI_UPDATE_FILE is '#{SECTION_CLI_UPDATE_FILE}'"
 	update_section_cli_now = !File.exists?(SECTION_CLI_UPDATE_FILE) || File.mtime(SECTION_CLI_UPDATE_FILE) < (Time.now - 60*60)
+	@logger.debug "File-derived value for update_section_cli_now is #{update_section_cli_now}"
 	update_section_cli_now = (ENV['SECTION_CLI_UPDATE'] == 'true') if ENV['SECTION_CLI_UPDATE'] # force either on or off
+	@logger.debug "Environment-overridden value for update_section_cli_now is #{update_section_cli_now}"
 	if update_section_cli_now
 		exit_status, stdout, stderr = cmd_execute(SECTION_CLI_PATH, "git pull")
 		exit_status==0 or $stderr.write "Warning: could not check for update to latest version of section.cli\n"
