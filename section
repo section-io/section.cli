@@ -11,7 +11,7 @@ require 'logger'
 
 TAR_LONGLINK = '././@LongLink'
 
-SECTION_CLI_PATH = File.dirname(__FILE__)
+SECTION_CLI_PATH = File.expand_path(File.dirname(__FILE__))
 VAGRANT_PATH = File.join(SECTION_CLI_PATH, "vagrant")
 APPS_PATH = File.join(SECTION_CLI_PATH, "apps")
 INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
@@ -30,6 +30,7 @@ SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 @logger.formatter = proc do |severity, datetime, progname, msg|
   "#{datetime} [#{severity}]: #{msg}\n"
 end
+@logger.debug "SECTION_CLI_PATH is '#{SECTION_CLI_PATH}'"
 
 def display_command_options()
 	puts "\n Options:\n"
