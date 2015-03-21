@@ -117,11 +117,15 @@ def update_app_repo_dir(config)
 	$stdout.write "Processing application: #{application_name}\n"
 	filefriendlyAppName = application_name.gsub(/[^a-z0-9_\.\-]+/,'').downcase
 	appDirectory = File.join(APPS_PATH, filefriendlyAppName)
+	section_config_json_file = File.join(appDirectory, 'section.config.json')
 
-
-	if Dir.exists?(appDirectory)
-		#Leave it in intact
-		$stdout.write "Repository exists and will not be altered\n"
+	if Dir.exist?(appDirectory) 
+		if File.exist?(section_config_json_file)
+			#Leave it in intact
+			$stdout.write "Repository exists and will not be altered\n"
+		else
+			abort "Unknown state, cannot continue. Missing file #{section_config_json_file}"
+		end
 	else
 		$stdout.write "Creating repository\n"
 		FileUtils.mkdir_p appDirectory
