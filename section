@@ -129,7 +129,7 @@ def update_app_repo_dir(config)
 	else
 		$stdout.write "Creating repository\n"
 		FileUtils.mkdir_p appDirectory
-		gitCmd = "git clone \"#{applicationConfig['repository']}\" #{appDirectory} --branch Development"
+		gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName} --branch Development"
 		puts("[.] #{gitCmd}")
 		system(gitCmd, :chdir => APPS_PATH)
 	end
