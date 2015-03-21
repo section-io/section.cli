@@ -130,8 +130,11 @@ def update_app_repo_dir(config)
 		$stdout.write "Creating repository\n"
 		FileUtils.mkdir_p appDirectory
 		gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName} --branch Development"
-		puts("[.] #{gitCmd}")
-		system(gitCmd, :chdir => APPS_PATH)
+		clone_succeeded = cmd_execute_interactive(APPS_PATH, gitCmd)
+		if not clone_succeeded
+			Dir.rmdir appDirectory
+			abort "Could not clone #{applicationConfig['repository']}"
+		end
 	end
 
 	File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
