@@ -161,7 +161,7 @@ if ! which('vagrant')
 end
 
 # TODO move all this SSH path finding logic into its own function
-vagrant_env_path = ENV['path'].dup
+vagrant_env_path = ENV['PATH'].dup
 if ! which('ssh')
 	# check for ssh in git directory for Windows
 	git_executable_path = which('git')
