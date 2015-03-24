@@ -45,6 +45,30 @@ def display_command_options()
 	puts "\n Submit any support questions to https://sectionio.zendesk.com/hc/en-us/requests/new or support@section.io"
 end
 
+def get_user_agent()
+
+	exit_status, section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
+	result = "section.cli/#{section_commit}"
+
+	result += " #{RUBY_ENGINE}/#{RUBY_VERSION} (#{RUBY_PLATFORM})"
+
+	exit_status, vagrant_version = cmd_execute(SECTION_CLI_PATH, 'vagrant --version')
+	if exit_status == 0
+		vagrant_version.sub!(/^vagrant\s*/i, '')
+		result += " vagrant/#{vagrant_version}"
+	end
+
+	exit_status, git_version = cmd_execute(SECTION_CLI_PATH, 'git --version')
+	if exit_status == 0
+		git_version.sub!(/^git\s+version\s*/i, '')
+		result += " git/#{git_version}"
+	end
+
+	# TODO SSH version
+
+	return result
+end
+
 def get_instance_config(token)
 	uri = URI.parse("https://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
 	http = Net::HTTP.new(uri.host, uri.port)
@@ -53,7 +77,7 @@ def get_instance_config(token)
 	http.verify_callback = lambda do |preverify_ok, ssl_context|
 		return OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s==SECTION_IO_THUMBPRINT_SHA1
 	end
-	config_str = http.get(uri).body
+	config_str = http.get(uri, { 'User-Agent' => get_user_agent()}).body
 	config = JSON.parse(config_str)
 	File.open(INSTANCE_CONFIG_FILE, 'w+') {|f| f.write(config_str) }
 	return config
