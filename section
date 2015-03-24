@@ -119,7 +119,7 @@ def update_app_repo_dir(config)
 	appDirectory = File.join(APPS_PATH, filefriendlyAppName)
 	section_config_json_file = File.join(appDirectory, 'section.config.json')
 
-	if Dir.exist?(appDirectory) 
+	if Dir.exist?(appDirectory)
 		if File.exist?(section_config_json_file)
 			#Leave it in intact
 			$stdout.write "Repository exists and will not be altered\n"
@@ -244,7 +244,7 @@ end
 
 def cmd_execute_interactive(path, cmd)
 	@logger.debug "Running [#{path}] #{cmd}"
-	return system(cmd, :chdir => path) 
+	return system(cmd, :chdir => path)
 end
 
 
@@ -260,7 +260,7 @@ def section_promote()
 	stdout.length!=0 or abort 'Couldn\'t determine current HEAD'
 	original_branch = stdout
 
-	#Set source branch name to current branch name 
+	#Set source branch name to current branch name
 	source_branch=original_branch
 
 	#Check that there are no local changes
