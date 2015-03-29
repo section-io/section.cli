@@ -186,18 +186,18 @@ if ! which('vagrant')
 end
 
 # TODO move all this SSH path finding logic into its own function
-vagrant_env_path = ENV['PATH'].dup
+@vagrant_env_path = ENV['PATH'].dup
 if ! which('ssh')
 	# check for ssh in git directory for Windows
 	git_executable_path = which('git')
 	if git_executable_path
 		try_ssh_directory_path = File.dirname(git_executable_path)
 		if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
-			vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
+			@vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
 		else
 			try_ssh_directory_path = File.join(File.dirname(git_executable_path), '..', 'bin')
 			if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
-				vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
+				@vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
 			else
 				puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
 				exit 1
@@ -272,6 +272,11 @@ def cmd_execute_interactive(path, cmd)
 	return system(cmd, :chdir => path)
 end
 
+def vagrant_execute(subcommand, args = [])
+	@logger.debug "Running Vagrant #{subcommand}"
+	all_args = [subcommand].concat(args)
+	system({ 'PATH' => @vagrant_env_path }, 'vagrant', *all_args, :chdir => VAGRANT_PATH)
+end
 
 def section_promote()
 	destination_branch='Production'
@@ -323,17 +328,16 @@ when "up"
 
 	section_init
 
-	system("vagrant up", :chdir => VAGRANT_PATH)
-
-	system({ 'PATH' => vagrant_env_path }, 'vagrant', 'ssh', '-c', 'sudo /vagrant/bootstrap.sh;', :chdir => VAGRANT_PATH)
+	vagrant_execute('up')
+	vagrant_execute('ssh', ['-c', 'sudo /vagrant/bootstrap.sh;'])
 
 when "reload"
 
 	copy_app_repo_to_hiera()
 	#Update hiera config
-	system("vagrant ssh -c 'sudo /vagrant/hiera/generate_hiera.sh;'", :chdir => VAGRANT_PATH)
+	vagrant_execute('ssh', ['-c', 'sudo /vagrant/hiera/generate_hiera.sh;'])
 	#Reload containers to reflect the latest changes
-	system("vagrant ssh -c 'sudo /vagrant/run_puppet.sh;'", :chdir => VAGRANT_PATH)
+	vagrant_execute('ssh', ['-c', 'sudo /vagrant/run_puppet.sh;'])
 
 when "pull"
 
