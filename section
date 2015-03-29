@@ -48,6 +48,7 @@ end
 def get_user_agent()
 
 	exit_status, section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
+	# NOTE section_commit will be wrong if we `git pull SECTION_CLI_PATH` before we run this code
 	result = "section.cli/#{section_commit}"
 
 	result += " #{RUBY_ENGINE}/#{RUBY_VERSION} (#{RUBY_PLATFORM})"
