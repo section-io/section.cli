@@ -41,7 +41,7 @@ def display_command_options()
 	puts "   * promote - Merge Development into Production and push result to your git repository\n"
 	puts "   * --help - Display this help content\n"
 
-	puts "\n Documentation can be found at https://sectionio.zendesk.com/hc/en-us\n"
+	puts "\n Documentation can be found at http://docs.section.io/en/latest/cli.html\n"
 	puts "\n Submit any support questions to https://sectionio.zendesk.com/hc/en-us/requests/new or support@section.io"
 end
 
@@ -178,6 +178,15 @@ def copy_app_repo_to_hiera()
 	dest_dir = File.join(REPOSITORIES_DIR, app_id)
 	FileUtils.mkdir_p dest_dir
 	FileUtils.cp_r(File.join(source_dir, "."), dest_dir, :remove_destination=>true)
+end
+
+def copy_app_repo_to_volume_source()
+
+	app_id = IO.read(APP_ID_FILE)
+	vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', app_id)
+	container_volume_repo_path = File.join('/opt/section.delivery/hiera/repos/')
+
+	vagrant_execute('ssh', ['-c', "sudo rsync -a --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"])
 end
 
 if ! which('vagrant')
@@ -334,10 +343,14 @@ when "up"
 when "reload"
 
 	copy_app_repo_to_hiera()
+	copy_app_repo_to_volume_source()
+
 	#Update hiera config
 	vagrant_execute('ssh', ['-c', 'sudo /vagrant/hiera/generate_hiera.sh;'])
 	#Reload containers to reflect the latest changes
 	vagrant_execute('ssh', ['-c', 'sudo /vagrant/run_puppet.sh;'])
+
+	puts "section.io proxy stack updated with the latest changes\n"
 
 when "pull"
 
