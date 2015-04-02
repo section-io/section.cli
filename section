@@ -175,6 +175,18 @@ def update_app_repo_dir(config)
 
 end
 
+def validate_section_config_json()
+	repo_dir = IO.read(REPOSITORY_PATH_FILE)
+	json_file = File.join(repo_dir, 'section.config.json')
+	begin
+		JSON.parse(IO.read(json_file))
+	rescue JSON::ParserError => err
+		error_detail = err.message[0, 80]
+		error_detail += '...' if err.message.length > 80
+		abort "Error Could not parse JSON file '#{json_file}':\n#{error_detail}"
+	end
+end
+
 def copy_app_repo_to_hiera()
 	#sync apps\friendlyname to C:\squixa\section.cli\vagrant\hiera\repos\<N>
 	source_dir = IO.read(REPOSITORY_PATH_FILE)
@@ -348,6 +360,7 @@ when "up"
 
 when "reload"
 
+	validate_section_config_json()
 	copy_app_repo_to_hiera()
 	copy_app_repo_to_volume_source()
 
