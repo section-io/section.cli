@@ -1,0 +1,20 @@
+#!/bin/sh
+
+RUBY_PATH=$(which ruby)
+if [ "$?" -ne 0 ]; then
+  # find Ruby on near Vagrant on Windows
+  VAGRANT_PATH=$(which vagrant)
+  LAST_EXIT=$?
+  RUBY_PATH="$(dirname "${VAGRANT_PATH}")/../embedded/bin/ruby"
+  if [ "$LAST_EXIT" -ne 0 ] || [ ! -x "$RUBY_PATH" ]; then
+    echo 'Warning: Cannot locate Ruby to perform pre-commit checks.'
+    exit 0
+  fi
+fi
+
+# ensure that section.config.json is at least valid JSON
+git show :section.config.json | ${RUBY_PATH} -r json -e 'JSON.parse($stdin.read())' >/dev/null 2>&1
+if [ "$?" -ne 0 ]; then
+  echo 'Error: File section.config.json cannot be parsed as JSON. Check its syntax.'
+  exit 1
+fi

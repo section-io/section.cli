@@ -162,6 +162,12 @@ def update_app_repo_dir(config)
 		end
 	end
 
+	hook_target = File.join(appDirectory, ".git/hooks/pre-commit")
+	if not File.exist?(hook_target)
+		File.link(File.join(SECTION_CLI_PATH, 'git-hooks-pre-commit'), hook_target)
+		File.chmod(0755, hook_target)
+	end
+
 	File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
 	File.open(APP_ID_FILE, 'w+') {|f| f.write(applicationConfig['application_id']) } #Write the current app id
 
