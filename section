@@ -204,7 +204,7 @@ def copy_app_repo_to_volume_source()
 	vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', app_id)
 	container_volume_repo_path = File.join('/opt/section.delivery/hiera/repos/')
 
-	vagrant_execute('ssh', ['-c', "sudo rsync -a --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"])
+	vagrant_execute('ssh', ['-c', "sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"])
 end
 
 if ! which('vagrant')
