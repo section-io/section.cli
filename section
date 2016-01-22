@@ -158,7 +158,7 @@ def update_app_repo_dir(config)
   else
     $stdout.write "Creating repository\n"
     FileUtils.mkdir_p appDirectory
-    gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName} --branch Development"
+    gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName}"
     clone_succeeded = cmd_execute_interactive(APPS_PATH, gitCmd)
     if not clone_succeeded
       Dir.rmdir appDirectory
