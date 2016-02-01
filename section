@@ -9,6 +9,8 @@ require 'json'
 require 'open3'
 require 'logger'
 
+STDOUT.sync = true
+
 TAR_LONGLINK = '././@LongLink'
 
 SECTION_CLI_PATH = File.expand_path(File.dirname(__FILE__))
@@ -89,6 +91,25 @@ def get_instance_config(token)
   return config
 end
 
+def get_local_instance_config()
+  if not File.exist?(INSTANCE_CONFIG_FILE)
+    puts "No local config file, loading from aperture"
+    if File.exist?(INSTANCE_TOKEN_FILE) then
+      token = IO.read(INSTANCE_TOKEN_FILE)
+      print "Running with existing token '#{token}'\n"
+      config = get_instance_config(token)
+    else
+      print "Unable to read the local config file, please run section up with your instance token"
+    end
+  else
+    config_str = IO.read(INSTANCE_CONFIG_FILE)
+    config = JSON.parse(config_str)
+  end
+
+  return config
+end
+
+
 # Cross-platform way of finding an executable in the $PATH.
 #  From: http://stackoverflow.com/a/5471032/20819
 #   which('ruby') #=> /usr/bin/ruby
@@ -142,43 +163,52 @@ end
 
 def update_app_repo_dir(config)
 
-  applicationConfig = config['accounts'][0]['applications'][0]
-  environmentConfig = applicationConfig['environments'][0]
-  application_name = applicationConfig['name']
-  $stdout.write "Processing application: #{application_name}\n"
-  filefriendlyAppName = application_name.gsub(/[^a-z0-9_\.\-]+/,'').downcase
-  appDirectory = File.join(APPS_PATH, filefriendlyAppName)
-  section_config_json_file = File.join(appDirectory, 'section.config.json')
+  index = 0
+  while index < config['accounts'][0]['applications'].length do
 
-  if Dir.exist?(appDirectory)
-    if File.exist?(section_config_json_file)
-      #Leave it in intact
-      $stdout.write "Repository exists and will not be altered\n"
+    applicationConfig = config['accounts'][0]['applications'][index]
+    environmentConfig = applicationConfig['environments'][0]
+    application_name = applicationConfig['name']
+    $stdout.write "Processing application: #{application_name}\n"
+    filefriendlyAppName = application_name.gsub(/[^a-z0-9_\.\-]+/,'_').downcase
+    appDirectory = File.join(APPS_PATH, filefriendlyAppName)
+    section_config_json_file = File.join(appDirectory, 'section.config.json')
+
+    if (index == 0)
+      #For the first application, collect the state files as this is the app that has section up run and will have command like push and pull run against it
+      File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
+      File.open(APP_ID_FILE, 'w+') {|f| f.write(applicationConfig['application_id']) } #Write the current app id
+      File.open(ENV_ID_FILE, 'w+') {|f| f.write(environmentConfig['environment_id']) } #Write the current env id
+    end
+
+    if Dir.exist?(appDirectory)
+      if File.exist?(section_config_json_file)
+        #Leave it in intact
+        $stdout.write "Repository exists and will not be altered\n"
+      else
+        abort "Unknown state, cannot continue. Missing file #{section_config_json_file}"
+      end
     else
-      abort "Unknown state, cannot continue. Missing file #{section_config_json_file}"
+      $stdout.write "Creating repository\n"
+      FileUtils.mkdir_p appDirectory
+      gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName}"
+      clone_succeeded = cmd_execute_interactive(APPS_PATH, gitCmd)
+      if not clone_succeeded
+        Dir.rmdir appDirectory
+        abort "Could not clone #{applicationConfig['repository']}"
+      end
     end
-  else
-    $stdout.write "Creating repository\n"
-    FileUtils.mkdir_p appDirectory
-    gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName}"
-    clone_succeeded = cmd_execute_interactive(APPS_PATH, gitCmd)
-    if not clone_succeeded
-      Dir.rmdir appDirectory
-      abort "Could not clone #{applicationConfig['repository']}"
+
+    hook_target = File.join(appDirectory, ".git/hooks/pre-commit")
+    if not File.exist?(hook_target)
+      File.link(File.join(SECTION_CLI_PATH, 'git-hooks-pre-commit'), hook_target)
+      File.chmod(0755, hook_target)
     end
+
+    File.open("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}", 'w+') {|f| f.write(appDirectory) } #Write the path to the repository here
+
+    index +=1
   end
-
-  hook_target = File.join(appDirectory, ".git/hooks/pre-commit")
-  if not File.exist?(hook_target)
-    File.link(File.join(SECTION_CLI_PATH, 'git-hooks-pre-commit'), hook_target)
-    File.chmod(0755, hook_target)
-  end
-
-  File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
-  File.open(APP_ID_FILE, 'w+') {|f| f.write(applicationConfig['application_id']) } #Write the current app id
-  File.open(ENV_ID_FILE, 'w+') {|f| f.write(environmentConfig['environment_id']) } #Write the current env id
-
-  File.open("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}", 'w+') {|f| f.write(appDirectory) } #Write the path to the repository here
 
 end
 
@@ -194,30 +224,44 @@ def validate_section_config_json()
   end
 end
 
-def get_repo_dirname()
-  app_id = IO.read(APP_ID_FILE)
-  env_id = IO.read(ENV_ID_FILE)
-  dest_dirname = 'app' + app_id + '-env' + env_id
+def get_repo_dirname(app_id, env_id)
+  if !app_id
+    app_id = IO.read(APP_ID_FILE)
+  end
+
+  if !env_id
+    env_id = IO.read(ENV_ID_FILE)
+  end
+
+  dest_dirname = "app#{app_id}-env#{env_id}"
   return dest_dirname
 end
 
-def copy_app_repo_to_hiera()
+def copy_app_repo_to_hiera(config)
   #sync apps\friendlyname to C:\squixa\section.cli\vagrant\hiera\repos\<N>
-  source_dir = IO.read(REPOSITORY_PATH_FILE)
 
-  #id = /\.(?<id>\d+)$/.match(file)[1]
-
-  dest_dir = File.join(REPOSITORIES_DIR, get_repo_dirname())
-  FileUtils.mkdir_p dest_dir
-  FileUtils.cp_r(File.join(source_dir, "."), dest_dir, :remove_destination=>true)
+  config['accounts'][0]['applications'].each do |applicationConfig|
+    source_dir = IO.read("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}")
+    dest_dir = File.join(REPOSITORIES_DIR, get_repo_dirname(applicationConfig['application_id'], applicationConfig['environments'][0]['environment_id']))
+    @logger.debug "Copying #{source_dir} to #{dest_dir}\n"
+    FileUtils.mkdir_p dest_dir
+    FileUtils.cp_r(File.join(source_dir, "."), dest_dir, :remove_destination=>true)
+  end
 end
 
-def copy_app_repo_to_volume_source()
+def copy_app_repo_to_volume_source(config)
 
-  vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname())
   container_volume_repo_path = File.join('/opt/section.delivery/hiera/repos/')
 
-  vagrant_execute('ssh', ['-c', "sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"])
+  ssh_cmd = "sudo rm -rf #{container_volume_repo_path}*"
+
+  config['accounts'][0]['applications'].each do |applicationConfig|
+    vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname(applicationConfig['application_id'], applicationConfig['environments'][0]['environment_id']))
+
+    ssh_cmd += " && sudo rsync -a --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"
+  end
+
+  vagrant_execute('ssh', ['-c', ssh_cmd])
 end
 
 if ! which('vagrant')
@@ -292,7 +336,7 @@ def section_init()
 
   config = get_instance_config(token)
   update_app_repo_dir(config)
-  copy_app_repo_to_hiera()
+  copy_app_repo_to_hiera(config)
 end
 
 def cmd_execute(path, cmd)
@@ -372,25 +416,19 @@ when "up"
   section_init
 
   vagrant_execute('up')
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh;'])
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/bootstrap.sh;'])
+  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh && sudo /vagrant/bootstrap.sh;'])
 
 when "reload"
-
   validate_section_config_json()
   vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh;'])
-  copy_app_repo_to_hiera()
-  copy_app_repo_to_volume_source()
+  config = get_local_instance_config()
+  copy_app_repo_to_hiera(config)
+  copy_app_repo_to_volume_source(config)
+
   app_id = IO.read(APP_ID_FILE)
 
   #TODO remove this step, local reload should not contact the Internet
-  #Update hiera config
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/hiera/generate_hiera.sh;'])
-
-  #Apply stack configuration
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/run-puppet.sh;'])
-  #Reload containers to reflect the latest changes
-  vagrant_execute('ssh', ['-c', "sudo /vagrant/update_containers.sh #{app_id};"])
+  vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{app_id};"])
 
   #TODO test the exit codes of the above commands before declaring success
   puts "section.io proxy stack updated with the latest changes\n"
