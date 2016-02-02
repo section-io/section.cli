@@ -253,15 +253,15 @@ def copy_app_repo_to_volume_source(config)
 
   container_volume_repo_path = File.join('/opt/section.delivery/hiera/repos/')
 
-  ssh_cmd = "sudo rm -rf #{container_volume_repo_path}*"
+  ssh_cmd = []
 
   config['accounts'][0]['applications'].each do |applicationConfig|
     vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname(applicationConfig['application_id'], applicationConfig['environments'][0]['environment_id']))
 
-    ssh_cmd += " && sudo rsync -a --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}"
+    ssh_cmd.push("sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}")
   end
 
-  vagrant_execute('ssh', ['-c', ssh_cmd])
+  vagrant_execute('ssh', ['-c', ssh_cmd.join(" && ")])
 end
 
 if ! which('vagrant')
