@@ -24,14 +24,15 @@ ENV_ID_FILE = File.join(VAGRANT_PATH, 'hiera', 'env_id')
 REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
 APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
 APERTURE_SCHEME = ENV['APERTURE_SCHEME'] || 'https'
-SECTION_IO_THUMBPRINT_SHA1 = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
+SECTION_IO_THUMBPRINT_SHA1 = 'dcf837d21228e3e4c9a4293aabbf1d14e4d6c01a'
+SECTION_IO_THUMBPRINT_SHA1_LEGACY = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
 SECTION_DATA_DIR = File.expand_path('~/.section')
 FileUtils.mkdir_p SECTION_DATA_DIR
 SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 SECTION_TARBALL_URL = ENV['SECTION_TARBALL_URL'] || 'http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz'
 
 @logger = Logger.new(STDERR)
-@logger.level = Logger::INFO #DEBUG
+@logger.level = ENV['SECTION_DEBUG'] == 'true' ? Logger::DEBUG : Logger::INFO
 @logger.formatter = proc do |severity, datetime, progname, msg|
   "#{datetime} [#{severity}]: #{msg}\n"
 end
@@ -40,14 +41,16 @@ end
 def display_command_options()
   puts "\n Options:\n"
   puts "   * up <token> - Bring up a new section virtual machine for the specified instance token\n"
-  puts "   * reload - Reload varnish with your latest local changes\n"
+  puts "   * init <token> - Make the application for the specified instance token the current application./\n"
+  puts "   * status - Show the git status for your current local application repository\n"
+  puts "   * reload - Reload local proxy stack with your changes\n"
   puts "   * pull - Pull down any updates commited to your git repository\n"
   puts "   * push <commit message> - Commit and push local changes to your git repository\n"
-  puts "   * promote - Merge Development into Production and push result to your git repository\n"
+  puts "   * promote - Merge the current branch into Production and push result to your git repository\n"
   puts "   * --help - Display this help content\n"
 
-  puts "\n Documentation can be found at http://docs.section.io/en/latest/cli.html\n"
-  puts "\n Submit any support questions to https://sectionio.zendesk.com/hc/en-us/requests/new or support@section.io"
+  puts "\n Documentation can be found at https://www.section.io/docs/cli/\n"
+  puts "\n Submit any support questions to https://support.section.io or support@section.io"
 end
 
 def get_user_agent()
@@ -77,12 +80,18 @@ end
 
 def get_instance_config(token)
   uri = URI.parse("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
+  @logger.debug "get_instance_config uri is '#{uri}'"
+
   http = Net::HTTP.new(uri.host, uri.port)
   if 'https' == APERTURE_SCHEME
     http.use_ssl = true
     http.verify_mode = OpenSSL::SSL::VERIFY_PEER
     http.verify_callback = lambda do |preverify_ok, ssl_context|
-      return OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s==SECTION_IO_THUMBPRINT_SHA1
+      thumbprint = OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s
+      @logger.debug "TLS certificate thumbprint is '#{thumbprint}'"
+      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1
+      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1_LEGACY
+      return false
     end
   end
   config_str = http.get(uri, { 'User-Agent' => get_user_agent()}).body
@@ -365,17 +374,26 @@ def vagrant_execute(subcommand, args = [])
   system({ 'PATH' => @vagrant_env_path }, 'vagrant', *all_args, :chdir => VAGRANT_PATH)
 end
 
+def get_branch_name()
+
+  repo_path = IO.read(REPOSITORY_PATH_FILE)
+
+  branch = nil
+  exit_status, stdout, stderr = cmd_execute(repo_path, "git rev-parse --abbrev-ref HEAD")
+  exit_status==0 or abort 'Could\'t check for clean git working copy'
+  stdout.length!=0 or abort 'Couldn\'t determine current HEAD'
+  branch = stdout
+
+  return branch
+end
+
 def section_promote()
   destination_branch='Production'
 
   repo_path = IO.read(REPOSITORY_PATH_FILE)
 
   #Get current branch name
-  original_branch = nil
-  exit_status, stdout, stderr = cmd_execute(repo_path, "git rev-parse --abbrev-ref HEAD")
-  exit_status==0 or abort 'Could\'t check for clean git working copy'
-  stdout.length!=0 or abort 'Couldn\'t determine current HEAD'
-  original_branch = stdout
+  original_branch = get_branch_name()
 
   #Set source branch name to current branch name
   source_branch=original_branch
@@ -405,6 +423,14 @@ def section_promote()
 
 end #section_promote
 
+def section_status()
+  git_path = IO.read(REPOSITORY_PATH_FILE)
+  gitCmd = "git status"
+
+  puts("[#{git_path}] #{gitCmd}")
+  exit_status, stdout, stderr = system(gitCmd, :chdir => git_path)
+  puts(stdout)
+end
 
 case ARGV[0]
 when "init"
@@ -438,7 +464,12 @@ when "pull"
   git_path = IO.read(REPOSITORY_PATH_FILE)
   gitCmd = "git pull"
   puts("[#{git_path}] #{gitCmd}")
-  system(gitCmd, :chdir => git_path)
+
+when 'status'
+
+  #NOTE: This will be deprecated by working directory context project
+  section_status
+
 
 when 'push'
 
@@ -449,8 +480,11 @@ when 'push'
   commit_message = ARGV[1]
   git_path = IO.read(REPOSITORY_PATH_FILE)
 
-  gitCmd = "git commit -am \"#{commit_message}\""
+  gitCmd = "git add ."
+  puts("[#{git_path}] #{gitCmd}")
+  system(gitCmd, :chdir => git_path)
 
+  gitCmd = "git commit -m \"#{commit_message}\""
   puts("[#{git_path}] #{gitCmd}")
   system(gitCmd, :chdir => git_path)
 
