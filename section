@@ -30,6 +30,8 @@ SECTION_DATA_DIR = File.expand_path('~/.section')
 FileUtils.mkdir_p SECTION_DATA_DIR
 SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 SECTION_TARBALL_URL = ENV['SECTION_TARBALL_URL'] || 'http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz'
+$git_executable_path = nil
+$git_version = nil
 
 @logger = Logger.new(STDERR)
 @logger.level = ENV['SECTION_DEBUG'] == 'true' ? Logger::DEBUG : Logger::INFO
@@ -67,11 +69,7 @@ def get_user_agent()
     result += " vagrant/#{vagrant_version}"
   end
 
-  exit_status, git_version = cmd_execute(SECTION_CLI_PATH, 'git --version')
-  if exit_status == 0
-    git_version.sub!(/^git\s+version\s*/i, '')
-    result += " git/#{git_version}"
-  end
+  result += " git/#{$git_version}"
 
   # TODO SSH version
 
@@ -278,38 +276,6 @@ if ! which('vagrant')
   exit 1
 end
 
-def ensure_ssh_on_vagrant_path ()
-  @vagrant_env_path = ENV['PATH'].dup
-
-  return if which('ssh')
-
-  # check for ssh in git directory for Windows
-  git_executable_path = which('git')
-  if git_executable_path
-    try_ssh_directory_paths = [
-      File.dirname(git_executable_path),
-      File.join(File.dirname(git_executable_path), '..', 'bin'),
-      File.join(File.dirname(git_executable_path), '..', 'usr', 'bin'),
-    ]
-
-    try_ssh_directory_paths.each do |try_ssh_directory_path|
-      if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
-        @vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
-        return
-      end
-    end
-  end
-
-  puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
-  exit 1
-end
-ensure_ssh_on_vagrant_path
-
-# TODO report all missing dependencies before exiting for a better user experience
-
-# TODO test for VirtualBox installation
-# TODO test for Git installation
-
 def section_init()
 
   # update section cli if not attempted for more than an hour, or if forced by environment variable
@@ -398,6 +364,9 @@ def section_promote()
   #Set source branch name to current branch name
   source_branch=original_branch
 
+  #Check that we're not already on the Production branch
+  source_branch != destination_branch or abort "Already on the #{destination_branch} branch, just use `section push`"
+
   #Check that there are no local changes
   exit_status, stdout, stderr = cmd_execute(repo_path, "git status --porcelain")
   exit_status==0 or abort 'Could\'t check for clean git working copy'
@@ -431,6 +400,60 @@ def section_status()
   exit_status, stdout, stderr = system(gitCmd, :chdir => git_path)
   puts(stdout)
 end
+
+def ensure_git_valid()
+  $git_executable_path = which('git')
+
+  if not $git_executable_path
+    puts 'git must be installed and on the PATH.'
+    exit 1
+  end
+
+  exit_status, $git_version, std_err = cmd_execute(SECTION_CLI_PATH, 'git --version')
+  if exit_status == 0
+    $git_version.sub!(/^git\s+version\s*/i, '')
+    $git_version_parts = $git_version.split('.') unless not $git_version
+
+    if (not $git_version_parts or $git_version_parts[0].to_i < 2)
+      puts "git version 2.0 or greater is required, currently installed version is #{$git_version}"
+      exit 1
+    end
+  else
+    puts "Unable to obtain git version, error when running `git --version`: #{std_err}"
+    exit exit_status
+  end
+
+end
+ensure_git_valid()
+
+def ensure_ssh_on_vagrant_path ()
+  @vagrant_env_path = ENV['PATH'].dup
+
+  return if which('ssh')
+
+  # check for ssh in git directory for Windows
+  try_ssh_directory_paths = [
+    File.dirname($git_executable_path),
+    File.join(File.dirname($git_executable_path), '..', 'bin'),
+    File.join(File.dirname($git_executable_path), '..', 'usr', 'bin'),
+  ]
+
+  try_ssh_directory_paths.each do |try_ssh_directory_path|
+    if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
+      @vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
+      return
+    end
+  end
+
+
+  puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
+  exit 1
+end
+ensure_ssh_on_vagrant_path
+
+# TODO report all missing dependencies before exiting for a better user experience
+
+# TODO test for VirtualBox installation
 
 case ARGV[0]
 when "init"
