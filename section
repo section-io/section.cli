@@ -267,7 +267,7 @@ def copy_app_repo_to_volume_source(config)
 
     ssh_cmd.push("sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}")
 
-    ssh_cmd.push("sudo /vagrant/remove_containers_if_proxystack_changed.sh #{applicationConfig['application_id']} #{applicationConfig['environments'][0]['environment_id']}")
+    ssh_cmd.push("sudo /vagrant/remove-containers-if-proxystack-changed.sh #{applicationConfig['application_id']} #{applicationConfig['environments'][0]['environment_id']}")
   end
 
   vagrant_execute('ssh', ['-c', ssh_cmd.join(" && ")])
