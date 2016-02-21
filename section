@@ -7,15 +7,15 @@ require 'open-uri'
 require 'rubygems/package'
 require 'json'
 require 'open3'
-require 'logger'
+require 'stringio'
 
 STDOUT.sync = true
 
-TAR_LONGLINK = '././@LongLink'
+TAR_LONGLINK = '././@LongLink'.freeze
 
 SECTION_CLI_PATH = File.expand_path(File.dirname(__FILE__))
-VAGRANT_PATH = File.join(SECTION_CLI_PATH, "vagrant")
-APPS_PATH = File.join(SECTION_CLI_PATH, "apps")
+VAGRANT_PATH = File.join(SECTION_CLI_PATH, 'vagrant')
+APPS_PATH = File.join(SECTION_CLI_PATH, 'apps')
 INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
 INSTANCE_CONFIG_FILE = File.join(VAGRANT_PATH, 'hiera', 'config.json')
 REPOSITORY_PATH_FILE = File.join(VAGRANT_PATH, 'hiera', 'repository_path')
@@ -24,8 +24,9 @@ ENV_ID_FILE = File.join(VAGRANT_PATH, 'hiera', 'env_id')
 REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
 APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
 APERTURE_SCHEME = ENV['APERTURE_SCHEME'] || 'https'
-SECTION_IO_THUMBPRINT_SHA1 = 'dcf837d21228e3e4c9a4293aabbf1d14e4d6c01a'
+SECTION_IO_THUMBPRINT_SHA1 = 'dcf837d21228e3e4c9a4293aabbf1d14e4d6c01a'.freeze
 SECTION_IO_THUMBPRINT_SHA1_LEGACY = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
+                                    .freeze
 SECTION_DATA_DIR = File.expand_path('~/.section')
 FileUtils.mkdir_p SECTION_DATA_DIR
 SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
@@ -33,17 +34,261 @@ SECTION_TARBALL_URL = ENV['SECTION_TARBALL_URL'] || 'http://s3-ap-southeast-2.am
 $git_executable_path = nil
 $git_version = nil
 
-@logger = Logger.new(STDERR)
-@logger.level = ENV['SECTION_DEBUG'] == 'true' ? Logger::DEBUG : Logger::INFO
-@logger.formatter = proc do |severity, datetime, progname, msg|
-  "#{datetime} [#{severity}]: #{msg}\n"
-end
-@logger.debug "SECTION_CLI_PATH is '#{SECTION_CLI_PATH}'"
+require 'logger'
+require 'english'
 
-def display_command_options()
+# DEBUG < INFO < WARN < ERROR < FATAL < UNKNOWN/ANY
+
+# Logger
+class SectionLogger
+  attr_reader :file_name
+
+  def initialize
+    @console_logger = Logger.new(STDERR)
+    @console_logger.level = ENV['SECTION_DEBUG'] == 'true' ? Logger::DEBUG : Logger::INFO
+    @console_logger.formatter = proc do |severity, _, _, msg|
+      severity == 'ANY' ? "#{msg}\n" : "#{severity}: #{msg}\n"
+    end
+
+    @file_name = File.join(SECTION_CLI_PATH, 'section.debug.log')
+    @file = File.open(@file_name, 'w+') # File::APPEND | File::CREAT |File::WRONLY
+    @file_logger = Logger.new(@file)
+    @file_logger.level = Logger::DEBUG
+    @file_logger.formatter = proc do |severity, datetime, _, msg|
+      severity = 'USER' if severity == 'ANY'
+      "#{datetime} [#{severity}]: #{msg}\n"
+    end
+  end
+
+  def debug(progname = nil, &block)
+    @console_logger.debug progname, &block
+    @file_logger.debug progname, &block
+  end
+
+  def info(progname = nil, &block)
+    @console_logger.info progname, &block
+    @file_logger.info progname, &block
+  end
+
+  def warn(progname = nil, &block)
+    @console_logger.warn progname, &block
+    @file_logger.warn progname, &block
+  end
+
+  def error(progname = nil, &block)
+    @console_logger.error progname, &block
+    @file_logger.error progname, &block
+  end
+
+  def fatal(progname = nil, &block)
+    @console_logger.fatal progname, &block
+    @file_logger.fatal progname, &block
+  end
+
+  def unknown(progname = nil, &block)
+    @console_logger.unknown progname, &block
+    @file_logger.unknown progname, &block
+  end
+
+  # Default user-level messages
+  def user(progname = nil, &block)
+    unknown progname, &block
+  end
+end
+
+def log_exit(err_msg, err_location)
+  unless err_msg.nil?
+    @logger.debug "Exiting message: #{err_msg.inspect}"
+    @logger.debug "Backtrace: #{err_location}"
+  end
+  @logger.debug 'Exiting'
+end
+
+at_exit { log_exit $ERROR_INFO, $ERROR_POSITION }
+
+@logger = SectionLogger.new
+def aperture_get_http(uri_stem, etag = nil)
+  uri = URI.parse("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}#{uri_stem}")
+  @logger.debug "uri to fetch is '#{uri}'"
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  if 'https' == APERTURE_SCHEME
+    http.use_ssl = true
+    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    http.verify_callback = lambda do |_, ssl_context|
+      thumbprint = OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s
+      @logger.debug "TLS certificate thumbprint is '#{thumbprint}'"
+      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1
+      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1_LEGACY
+      return false
+    end
+  end
+
+  request = Net::HTTP::Get.new uri.request_uri
+  request['User-Agent'] = user_agent
+  request['If-None-Match'] = etag unless etag.nil? || etag.empty?
+
+  request.basic_auth 'section.cli', IO.read(INSTANCE_TOKEN_FILE)
+  response = http.request request
+
+  return response.body, response['ETag']
+end
+SECTION_PROXYTEMPLATE_FILE = File.join(SECTION_DATA_DIR, 'proxy_templates.json')
+
+def section_append(proxy_template_name, proxy_name)
+  # Get the available proxytemplate list
+  proxy_templates = load_proxy_templates
+
+  # If no proxy_template_name provided show error displaying the available template names
+  if proxy_template_name.nil? || proxy_template_name.empty?
+    display_section_append_usage
+    display_section_append_available_templates(proxy_templates)
+    abort
+  end
+
+  # If the proxy_template_name doesn't match the available list show error displaying the available template names
+  proxy_template = proxy_templates.find { |t| t['name'] == proxy_template_name }
+  if proxy_template.nil?
+    @logger.user "\n*** Invalid proxy_template_name '#{proxy_template_name}' ***\n\n"
+    display_section_append_available_templates(proxy_templates)
+    abort
+  end
+
+  # If no proxy_name provided show error
+  if proxy_name.nil? || proxy_name.empty?
+    display_append_error "\n*** missing proxy_name ***\n"
+  end
+
+  # If proxy_name is invalid show error
+  if proxy_name !~ /^[0-9a-z]+$/i
+    display_append_error "\n*** invalid proxy_name '#{proxy_name}', can only contain letters or numbers ***\n"
+  end
+
+  @logger.debug('Load up the section.config.json and append the new proxy')
+  config = load_and_validate_section_config_json
+
+  # If proxyname has already been used show error
+  # TODO: Check that the name doesn't match reserved folder names like custom_errors
+  if config['proxychain'].any? { |p| p['name'] == proxy_name }
+    display_append_error "\n*** invalid proxy_name '#{proxy_name}', a proxy with that name already exists ***\n"
+  end
+
+  new_proxy = { name: proxy_name, image: proxy_template['image'] }
+  config['proxychain'].push(new_proxy)
+  update_section_config_json(config)
+
+  @logger.debug("Downloading inital proxy state files for #{proxy_template_name}")
+  initial_state_api_uri = "/api/v1/proxytemplate/initialstate?proxyTemplateName=#{URI.escape(proxy_template_name)}"
+  initial_state_file_string, _etag = aperture_get_http(initial_state_api_uri)
+  initial_state_file = StringIO.new initial_state_file_string
+
+  repo_dir = IO.read(REPOSITORY_PATH_FILE)
+  initial_state_destination = File.join(repo_dir, proxy_name)
+  @logger.debug("Extracting initial state into #{initial_state_destination}")
+  extract_tar_gzip(initial_state_file, initial_state_destination)
+
+  @logger.user "Proxy #{proxy_name} has been added to your repository, now reloading your local instance to reflect these changes"
+  section_reload
+end
+
+def load_proxy_templates
+  @logger.debug 'Loading proxy template list'
+
+  download_proxy_templates_from_api
+
+  @logger.debug "Checking proxy template list cache file '#{SECTION_PROXYTEMPLATE_FILE}'"
+  if File.exist?(SECTION_PROXYTEMPLATE_FILE)
+    templates_str = IO.read(SECTION_PROXYTEMPLATE_FILE)
+  end
+
+  if templates_str.nil? || templates_str.empty?
+    @logger.error('Unable to load proxy template list, no local cache available')
+    abort
+  end
+
+  # JSON parse API respone
+  begin
+    JSON.parse(templates_str)
+  rescue JSON::ParserError => err
+    error_detail = err.message[0, 80]
+    error_detail += '...' if err.message.length > 80
+    @logger.error "Could not fetch proxytemplate list JSON file:\n#{error_detail}"
+    abort
+  end
+end
+
+def download_proxy_templates_from_api
+  @logger.debug 'Loading proxy template list from API'
+
+  if File.exist?("#{SECTION_PROXYTEMPLATE_FILE}.etag")
+    etag = IO.read("#{SECTION_PROXYTEMPLATE_FILE}.etag")
+  end
+
+  # Catch http fetch errors because the local cache can be used if it's available
+  begin
+    templates_str, etag = aperture_get_http('/api/v1/proxytemplate', etag)
+  rescue StandardError => err
+    @logger.warn("Unable to load proxy templates from API: #{err.message}")
+  end
+
+  if !templates_str.nil? && !templates_str.empty?
+    File.open(SECTION_PROXYTEMPLATE_FILE, 'w+') { |f| f.write(templates_str) }
+
+    # Write the etag to a file for checking next time we load this
+    if !etag.nil? && !etag.empty?
+      File.open("#{SECTION_PROXYTEMPLATE_FILE}.etag", 'w+') { |f| f.write(etag) }
+    end
+  end
+end
+
+def display_section_append_usage
+  @logger.user "\nUsage: \n\tsection append <proxy_template_name> <proxy_name>\n\n"
+end
+
+def display_append_error(message)
+  @logger.user message
+  display_section_append_usage
+  abort
+end
+
+def display_section_append_available_templates(proxy_templates)
+  @logger.user "-- Available proxy_template_names --\n"
+  proxy_templates.each do |t|
+    @logger.user " * '#{t['name']}' - #{t['label']}, #{t['description']}"
+  end
+end
+def extract_tar_gzip(source, destination)
+  Gem::Package::TarReader.new(Zlib::GzipReader.new(source)) do |tar|
+    dest = nil
+    tar.each do |entry|
+      if entry.full_name == TAR_LONGLINK
+        dest = File.join destination, entry.read.strip
+        next
+      end
+      dest ||= File.join destination, entry.full_name
+      if entry.directory?
+        FileUtils.rm_rf dest unless File.directory? dest
+        FileUtils.mkdir_p dest, mode: entry.header.mode, verbose: false
+      elsif entry.file?
+        FileUtils.mkdir_p File.dirname(dest), verbose: false
+        FileUtils.rm_rf dest unless File.file? dest
+        File.open dest, 'wb' do |f|
+          f.print entry.read
+        end
+        FileUtils.chmod entry.header.mode, dest, verbose: false
+      elsif entry.header.typeflag == '2' # Symlink!
+        File.symlink entry.header.linkname, dest
+      end
+      dest = nil
+    end
+  end
+end
+
+def display_command_options
   puts "\n Options:\n"
   puts "   * up <token> - Bring up a new section virtual machine for the specified instance token\n"
   puts "   * init <token> - Make the application for the specified instance token the current application./\n"
+  puts "   * append <proxyTemplateName> <proxyName> - Add a new proxy to your stack./\n"
   puts "   * status - Show the git status for your current local application repository\n"
   puts "   * reload - Reload local proxy stack with your changes\n"
   puts "   * pull - Pull down any updates commited to your git repository\n"
@@ -55,9 +300,8 @@ def display_command_options()
   puts "\n Submit any support questions to https://support.section.io or support@section.io"
 end
 
-def get_user_agent()
-
-  exit_status, section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
+def user_agent
+  _, section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
   # NOTE section_commit will be wrong if we `git pull SECTION_CLI_PATH` before we run this code
   result = "section.cli/#{section_commit}"
 
@@ -69,53 +313,32 @@ def get_user_agent()
     result += " vagrant/#{vagrant_version}"
   end
 
-  result += " git/#{$git_version}"
+  result + " git/#{$git_version}"
 
-  # TODO SSH version
-
-  return result
+  # TODO: SSH version
 end
 
 def get_instance_config(token)
-  uri = URI.parse("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
-  @logger.debug "get_instance_config uri is '#{uri}'"
-
-  http = Net::HTTP.new(uri.host, uri.port)
-  if 'https' == APERTURE_SCHEME
-    http.use_ssl = true
-    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
-    http.verify_callback = lambda do |preverify_ok, ssl_context|
-      thumbprint = OpenSSL::Digest::SHA1.new(ssl_context.chain[0].to_der).to_s
-      @logger.debug "TLS certificate thumbprint is '#{thumbprint}'"
-      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1
-      return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1_LEGACY
-      return false
-    end
-  end
-  config_str = http.get(uri, { 'User-Agent' => get_user_agent()}).body
-  config = JSON.parse(config_str)
-  File.open(INSTANCE_CONFIG_FILE, 'w+') {|f| f.write(config_str) }
-  return config
+  config_str, _etag = aperture_get_http("/instance/getconfig?token=#{token}")
+  File.open(INSTANCE_CONFIG_FILE, 'w+') { |f| f.write(config_str) }
+  JSON.parse(config_str)
 end
 
-def get_local_instance_config()
-  if not File.exist?(INSTANCE_CONFIG_FILE)
-    puts "No local config file, loading from aperture"
-    if File.exist?(INSTANCE_TOKEN_FILE) then
+def local_instance_config
+  if !File.exist?(INSTANCE_CONFIG_FILE)
+    @logger.user 'No local config file, loading from aperture'
+    if File.exist?(INSTANCE_TOKEN_FILE)
       token = IO.read(INSTANCE_TOKEN_FILE)
-      print "Running with existing token '#{token}'\n"
-      config = get_instance_config(token)
+      @logger.user "Running with existing token '#{token}'"
+      return get_instance_config(token)
     else
-      print "Unable to read the local config file, please run section up with your instance token"
+      @logger.user 'Unable to read the local config file, please run section up with your instance token'
     end
   else
     config_str = IO.read(INSTANCE_CONFIG_FILE)
-    config = JSON.parse(config_str)
+    return JSON.parse(config_str)
   end
-
-  return config
 end
-
 
 # Cross-platform way of finding an executable in the $PATH.
 #  From: http://stackoverflow.com/a/5471032/20819
@@ -123,103 +346,75 @@ end
 def which(cmd)
   exts = ENV['PATHEXT'] ? ENV['PATHEXT'].split(';') : ['']
   ENV['PATH'].split(File::PATH_SEPARATOR).each do |path|
-    exts.each { |ext|
+    exts.each do |ext|
       exe = File.join(path, "#{cmd}#{ext}")
       return exe if File.executable?(exe) && !File.directory?(exe)
-    }
+    end
   end
-  return nil
 end
 
-def download_latest_vagrant_if_needed()
-
-  print "Downloading latest vagrant files to #{VAGRANT_PATH}\n"
+def download_latest_vagrant_if_needed
+  @logger.user "Downloading latest vagrant files to #{VAGRANT_PATH}"
 
   uri = URI.parse(SECTION_TARBALL_URL)
-  filename = File.basename(uri.path)
-  download_file = File.join(SECTION_CLI_PATH, filename)
 
   destination = SECTION_CLI_PATH
 
   source = open(uri)
-  Gem::Package::TarReader.new( Zlib::GzipReader.new(source) ) do |tar|
-    dest = nil
-    tar.each do |entry|
-      if entry.full_name == TAR_LONGLINK
-        dest = File.join destination, entry.read.strip
-        next
-      end
-      dest ||= File.join destination, entry.full_name
-      if entry.directory?
-        FileUtils.rm_rf dest unless File.directory? dest
-        FileUtils.mkdir_p dest, :mode => entry.header.mode, :verbose => false
-      elsif entry.file?
-        FileUtils.mkdir_p File.dirname(dest), :verbose => false
-        FileUtils.rm_rf dest unless File.file? dest
-        File.open dest, "wb" do |f|
-          f.print entry.read
-        end
-        FileUtils.chmod entry.header.mode, dest, :verbose => false
-      elsif entry.header.typeflag == '2' #Symlink!
-        File.symlink entry.header.linkname, dest
-      end
-      dest = nil
-    end
-  end
+
+  extract_tar_gzip(source, destination)
 end
 
 def update_app_repo_dir(config)
-
   index = 0
-  while index < config['accounts'][0]['applications'].length do
+  while index < config['accounts'][0]['applications'].length
 
-    applicationConfig = config['accounts'][0]['applications'][index]
-    environmentConfig = applicationConfig['environments'][0]
-    application_name = applicationConfig['name']
+    application_config = config['accounts'][0]['applications'][index]
+    environment_config = application_config['environments'][0]
+    application_name = application_config['name']
     $stdout.write "Processing application: #{application_name}\n"
-    filefriendlyAppName = application_name.gsub(/[^a-z0-9_\.\-]+/,'_').downcase
-    appDirectory = File.join(APPS_PATH, filefriendlyAppName)
-    section_config_json_file = File.join(appDirectory, 'section.config.json')
+    file_friendly_app_name = application_name.gsub(/[^a-z0-9_\.\-]+/, '_').downcase
+    app_directory = File.join(APPS_PATH, file_friendly_app_name)
+    section_config_json_file = File.join(app_directory, 'section.config.json')
 
-    if (index == 0)
-      #For the first application, collect the state files as this is the app that has section up run and will have command like push and pull run against it
-      File.open(REPOSITORY_PATH_FILE, 'w+') {|f| f.write(appDirectory) } #Write the path to the current repository
-      File.open(APP_ID_FILE, 'w+') {|f| f.write(applicationConfig['application_id']) } #Write the current app id
-      File.open(ENV_ID_FILE, 'w+') {|f| f.write(environmentConfig['environment_id']) } #Write the current env id
+    if index == 0
+      # For the first application, collect the state files as this is the app that has section up run and will have command like push and pull run against it
+      File.open(REPOSITORY_PATH_FILE, 'w+') { |f| f.write(app_directory) } # Write the path to the current repository
+      File.open(APP_ID_FILE, 'w+') { |f| f.write(application_config['application_id']) } # Write the current app id
+      File.open(ENV_ID_FILE, 'w+') { |f| f.write(environment_config['environment_id']) } # Write the current env id
     end
 
-    if Dir.exist?(appDirectory)
+    if Dir.exist?(app_directory)
       if File.exist?(section_config_json_file)
-        #Leave it in intact
+        # Leave it in intact
         $stdout.write "Repository exists and will not be altered\n"
       else
         abort "Unknown state, cannot continue. Missing file #{section_config_json_file}"
       end
     else
       $stdout.write "Creating repository\n"
-      FileUtils.mkdir_p appDirectory
-      gitCmd = "git clone \"#{applicationConfig['repository']}\" #{filefriendlyAppName}"
-      clone_succeeded = cmd_execute_interactive(APPS_PATH, gitCmd)
-      if not clone_succeeded
-        Dir.rmdir appDirectory
-        abort "Could not clone #{applicationConfig['repository']}"
+      FileUtils.mkdir_p app_directory
+      git_cmd = "git clone \"#{application_config['repository']}\" #{file_friendly_app_name}"
+      clone_succeeded = cmd_execute_interactive(APPS_PATH, git_cmd)
+      unless clone_succeeded
+        Dir.rmdir app_directory
+        abort "Could not clone #{application_config['repository']}"
       end
     end
 
-    hook_target = File.join(appDirectory, ".git/hooks/pre-commit")
-    if not File.exist?(hook_target)
+    hook_target = File.join(app_directory, '.git/hooks/pre-commit')
+    unless File.exist?(hook_target)
       File.link(File.join(SECTION_CLI_PATH, 'git-hooks-pre-commit'), hook_target)
       File.chmod(0755, hook_target)
     end
 
-    File.open("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}", 'w+') {|f| f.write(appDirectory) } #Write the path to the repository here
+    File.open("#{REPOSITORY_PATH_FILE}.app.#{application_config['application_id']}", 'w+') { |f| f.write(app_directory) } # Write the path to the repository here
 
-    index +=1
+    index += 1
   end
-
 end
 
-def validate_section_config_json()
+def load_and_validate_section_config_json
   repo_dir = IO.read(REPOSITORY_PATH_FILE)
   json_file = File.join(repo_dir, 'section.config.json')
   begin
@@ -231,80 +426,75 @@ def validate_section_config_json()
   end
 end
 
+def update_section_config_json(config)
+  repo_dir = IO.read(REPOSITORY_PATH_FILE)
+  json_file = File.join(repo_dir, 'section.config.json')
+  @logger.debug("Updating #{json_file}")
+  File.open(json_file, 'w+') { |f| f.write(JSON.pretty_generate(config, indent: '    ')) }
+end
+
 def get_repo_dirname(app_id, env_id)
-  if !app_id
-    app_id = IO.read(APP_ID_FILE)
-  end
+  app_id = IO.read(APP_ID_FILE) unless app_id
 
-  if !env_id
-    env_id = IO.read(ENV_ID_FILE)
-  end
+  env_id = IO.read(ENV_ID_FILE) unless env_id
 
-  dest_dirname = "app#{app_id}-env#{env_id}"
-  return dest_dirname
+  "app#{app_id}-env#{env_id}"
 end
 
 def copy_app_repo_to_hiera(config)
-  #sync apps\friendlyname to C:\squixa\section.cli\vagrant\hiera\repos\<N>
+  # sync apps\friendlyname to C:\squixa\section.cli\vagrant\hiera\repos\<N>
 
-  config['accounts'][0]['applications'].each do |applicationConfig|
-    source_dir = IO.read("#{REPOSITORY_PATH_FILE}.app.#{applicationConfig['application_id']}")
-    dest_dir = File.join(REPOSITORIES_DIR, get_repo_dirname(applicationConfig['application_id'], applicationConfig['environments'][0]['environment_id']))
+  config['accounts'][0]['applications'].each do |application_config|
+    source_dir = IO.read("#{REPOSITORY_PATH_FILE}.app.#{application_config['application_id']}")
+    dest_dir = File.join(REPOSITORIES_DIR, get_repo_dirname(application_config['application_id'], application_config['environments'][0]['environment_id']))
     @logger.debug "Copying #{source_dir} to #{dest_dir}\n"
     FileUtils.mkdir_p dest_dir
-    FileUtils.cp_r(File.join(source_dir, "."), dest_dir, :remove_destination=>true)
+    FileUtils.cp_r(File.join(source_dir, '.'), dest_dir, remove_destination: true)
   end
 end
 
 def copy_app_repo_to_volume_source(config)
-
   container_volume_repo_path = File.join('/opt/section.delivery/hiera/repos/')
 
   ssh_cmd = []
 
-  config['accounts'][0]['applications'].each do |applicationConfig|
-    vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname(applicationConfig['application_id'], applicationConfig['environments'][0]['environment_id']))
+  config['accounts'][0]['applications'].each do |application_config|
+    vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname(application_config['application_id'], application_config['environments'][0]['environment_id']))
 
     ssh_cmd.push("sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}")
 
-    ssh_cmd.push("sudo /vagrant/remove-containers-if-proxystack-changed.sh #{applicationConfig['application_id']} #{applicationConfig['environments'][0]['environment_id']}")
+    ssh_cmd.push("sudo /vagrant/remove-containers-if-proxystack-changed.sh #{application_config['application_id']} #{application_config['environments'][0]['environment_id']}")
   end
 
-  vagrant_execute('ssh', ['-c', ssh_cmd.join(" && ")])
+  vagrant_execute('ssh', ['-c', ssh_cmd.join(' && ')])
 end
 
-if ! which('vagrant')
-  puts 'Vagrant must be installed and on the PATH. Vagrant can be downloaded at https://www.vagrantup.com/'
-  exit 1
-end
-
-def section_init()
-
+def section_init
   # update section cli if not attempted for more than an hour, or if forced by environment variable
   @logger.debug "SECTION_CLI_UPDATE_FILE is '#{SECTION_CLI_UPDATE_FILE}'"
-  update_section_cli_now = !File.exists?(SECTION_CLI_UPDATE_FILE) || File.mtime(SECTION_CLI_UPDATE_FILE) < (Time.now - 60*60)
+  update_section_cli_now = !File.exist?(SECTION_CLI_UPDATE_FILE) || File.mtime(SECTION_CLI_UPDATE_FILE) < (Time.now - 60 * 60)
   @logger.debug "File-derived value for update_section_cli_now is #{update_section_cli_now}"
   update_section_cli_now = (ENV['SECTION_CLI_UPDATE'] == 'true') if ENV['SECTION_CLI_UPDATE'] # force either on or off
   @logger.debug "Environment-overridden value for update_section_cli_now is #{update_section_cli_now}"
   if update_section_cli_now
-    exit_status, stdout, stderr = cmd_execute(SECTION_CLI_PATH, "git pull")
-    exit_status==0 or $stderr.write "Warning: could not check for update to latest version of section.cli\n"
+    exit_status, = cmd_execute(SECTION_CLI_PATH, 'git pull')
+    $stderr.write "Warning: could not check for update to latest version of section.cli\n" unless exit_status == 0
     FileUtils.touch SECTION_CLI_UPDATE_FILE
   end
 
-  #TODO: Allow a command line arg to force a reload
-  #if not File.directory?(VAGRANT_PATH)
-    download_latest_vagrant_if_needed()
-  #end
+  # TODO: Allow a command line arg to force a reload
+  # if not File.directory?(VAGRANT_PATH)
+  download_latest_vagrant_if_needed
+  # end
 
-  if ARGV[1] != nil then
-    FileUtils.mkdir_p File.join(VAGRANT_PATH, 'hiera') #, :verbose => false
+  if !ARGV[1].nil?
+    FileUtils.mkdir_p File.join(VAGRANT_PATH, 'hiera') # , :verbose => false
     token = ARGV[1]
 
-    File.open(INSTANCE_TOKEN_FILE, 'w+') {|f| f.write(ARGV[1]) }
-  elsif File.exist?(INSTANCE_TOKEN_FILE) then
+    File.open(INSTANCE_TOKEN_FILE, 'w+') { |f| f.write(ARGV[1]) }
+  elsif File.exist?(INSTANCE_TOKEN_FILE)
     token = IO.read(INSTANCE_TOKEN_FILE)
-    print "Running with existing token '#{token}'\n"
+    @logger.user "Running with existing token '#{token}'\n"
   else
     $stderr.write "Error: Please provide your instance token as a parameter\n"
     $stderr.write "ie. \n\tsection up <token>\n\n"
@@ -317,7 +507,7 @@ def section_init()
 end
 
 def cmd_execute(path, cmd)
-  Open3.popen3(cmd, :chdir=>path) {|stdin, stdout, stderr, wait_thr|
+  Open3.popen3(cmd, chdir: path) do |_, stdout, stderr, wait_thr|
     @logger.debug "Running [#{path}] #{cmd}"
 
     exit_status = wait_thr.value # Process::Status object returned.
@@ -325,110 +515,119 @@ def cmd_execute(path, cmd)
     stderr_result = stderr.read.chomp
 
     @logger.debug "exit_status: #{exit_status}"
-    @logger.debug "stdout: "+stdout_result
-    @logger.debug "stderr: "+stderr_result
+    @logger.debug "stdout: #{stdout_result}"
+    @logger.debug "stderr: #{stderr_result}"
     return exit_status, stdout_result, stderr_result
-  }
+  end
 end
 
 def cmd_execute_interactive(path, cmd)
   @logger.debug "Running [#{path}] #{cmd}"
-  return system(cmd, :chdir => path)
+  system(cmd, chdir: path)
 end
 
 def vagrant_execute(subcommand, args = [])
   @logger.debug "Running Vagrant #{subcommand} with args: #{args}"
   all_args = [subcommand].concat(args)
-  system({ 'PATH' => @vagrant_env_path }, 'vagrant', *all_args, :chdir => VAGRANT_PATH)
+  system({ 'PATH' => @vagrant_env_path }, 'vagrant', *all_args, chdir: VAGRANT_PATH)
 end
 
-def get_branch_name()
+def branch_name
+  repo_path = IO.read(REPOSITORY_PATH_FILE)
+
+  exit_status, stdout, = cmd_execute(repo_path, 'git rev-parse --abbrev-ref HEAD')
+  abort 'Could\'t check for clean git working copy' unless exit_status == 0
+  abort 'Couldn\'t determine current HEAD' if stdout.empty?
+  stdout
+end
+
+def section_promote
+  destination_branch = 'Production'
 
   repo_path = IO.read(REPOSITORY_PATH_FILE)
 
-  branch = nil
-  exit_status, stdout, stderr = cmd_execute(repo_path, "git rev-parse --abbrev-ref HEAD")
-  exit_status==0 or abort 'Could\'t check for clean git working copy'
-  stdout.length!=0 or abort 'Couldn\'t determine current HEAD'
-  branch = stdout
+  # Get current branch name
+  original_branch = branch_name
 
-  return branch
-end
+  # Set source branch name to current branch name
+  source_branch = original_branch
 
-def section_promote()
-  destination_branch='Production'
+  # Check that we're not already on the Production branch
+  abort "Already on the #{destination_branch} branch, just use `section push`" unless source_branch != destination_branch
 
-  repo_path = IO.read(REPOSITORY_PATH_FILE)
+  # Check that there are no local changes
+  exit_status, stdout, = cmd_execute(repo_path, 'git status --porcelain')
+  abort 'Could\'t check for clean git working copy' unless exit_status == 0
+  abort '"section push" or discard changes before continuing.' if stdout.empty?
 
-  #Get current branch name
-  original_branch = get_branch_name()
+  # Push current branch
+  cmd_execute_interactive(repo_path, 'git push origin') || abort('Failed to push current branch')
 
-  #Set source branch name to current branch name
-  source_branch=original_branch
+  # Checkout destination branch
+  cmd_execute(repo_path, "git checkout #{destination_branch}") || abort("Couldn't checkout #{destination_branch}")
 
-  #Check that we're not already on the Production branch
-  source_branch != destination_branch or abort "Already on the #{destination_branch} branch, just use `section push`"
+  # Pull destination branch
+  cmd_execute_interactive(repo_path, 'git pull') || abort("Couldn't update #{destination_branch}")
 
-  #Check that there are no local changes
-  exit_status, stdout, stderr = cmd_execute(repo_path, "git status --porcelain")
-  exit_status==0 or abort 'Could\'t check for clean git working copy'
-  stdout.length==0 or abort '"section push" or discard changes before continuing.'
+  # Merge source branch into destination branch
+  cmd_execute(repo_path, "git merge --no-ff -m \"#{source_branch} merged to #{destination_branch}\" #{source_branch}") || exit
 
-  #Push current branch
-  cmd_execute_interactive(repo_path, "git push origin") or abort 'Failed to push current branch'
+  # Push destination branch
+  cmd_execute_interactive(repo_path, 'git push') || exit
 
-  #Checkout destination branch
-  cmd_execute(repo_path, "git checkout #{destination_branch}") or abort "Couldn't checkout #{destination_branch}"
+  # Checkout original branch
+  cmd_execute(repo_path, "git checkout #{original_branch}") || exit
+end # section_promote
 
-  #Pull destination branch
-  cmd_execute_interactive(repo_path,"git pull") or abort "Couldn't update #{destination_branch}"
-
-  #Merge source branch into destination branch
-  cmd_execute(repo_path,"git merge --no-ff -m \"#{source_branch} merged to #{destination_branch}\" #{source_branch}") or exit
-
-  #Push destination branch
-  cmd_execute_interactive(repo_path, "git push") or exit
-
-  #Checkout original branch
-  cmd_execute(repo_path,"git checkout #{original_branch}") or exit
-
-end #section_promote
-
-def section_status()
+def section_status
   git_path = IO.read(REPOSITORY_PATH_FILE)
-  gitCmd = "git status"
+  git_cmd = 'git status'
 
-  puts("[#{git_path}] #{gitCmd}")
-  exit_status, stdout, stderr = system(gitCmd, :chdir => git_path)
-  puts(stdout)
+  @logger.user("[#{git_path}] #{git_cmd}")
+  _, stdout, = system(git_cmd, chdir: git_path)
+  @logger.user(stdout)
 end
 
-def ensure_git_valid()
+def section_reload
+  load_and_validate_section_config_json
+  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh;'])
+  config = local_instance_config
+  copy_app_repo_to_hiera(config)
+  copy_app_repo_to_volume_source(config)
+
+  app_id = IO.read(APP_ID_FILE)
+
+  # TODO: remove this step, local reload should not contact the Internet
+  vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{app_id};"])
+
+  # TODO: test the exit codes of the above commands before declaring success
+  @logger.user "section.io proxy stack updated with the latest changes\n"
+end
+
+def ensure_git_valid
   $git_executable_path = which('git')
 
-  if not $git_executable_path
-    puts 'git must be installed and on the PATH.'
+  unless $git_executable_path
+    @logger.user 'git must be installed and on the PATH.'
     exit 1
   end
 
   exit_status, $git_version, std_err = cmd_execute(SECTION_CLI_PATH, 'git --version')
   if exit_status == 0
     $git_version.sub!(/^git\s+version\s*/i, '')
-    $git_version_parts = $git_version.split('.') unless not $git_version
+    $git_version_parts = $git_version.split('.') if $git_version
 
-    if (not $git_version_parts or $git_version_parts[0].to_i < 2)
-      puts "git version 2.0 or greater is required, currently installed version is #{$git_version}"
+    if !$git_version_parts || ($git_version_parts[0].to_i < 2)
+      @logger.user "git version 2.0 or greater is required, currently installed version is #{$git_version}"
       exit 1
     end
   else
-    puts "Unable to obtain git version, error when running `git --version`: #{std_err}"
+    @logger.user "Unable to obtain git version, error when running `git --version`: #{std_err}"
     exit exit_status
   end
-
 end
-ensure_git_valid()
 
-def ensure_ssh_on_vagrant_path ()
+def ensure_ssh_on_vagrant_path
   @vagrant_env_path = ENV['PATH'].dup
 
   return if which('ssh')
@@ -437,100 +636,104 @@ def ensure_ssh_on_vagrant_path ()
   try_ssh_directory_paths = [
     File.dirname($git_executable_path),
     File.join(File.dirname($git_executable_path), '..', 'bin'),
-    File.join(File.dirname($git_executable_path), '..', 'usr', 'bin'),
+    File.join(File.dirname($git_executable_path), '..', 'usr', 'bin')
   ]
 
-  try_ssh_directory_paths.each do |try_ssh_directory_path|
-    if File.executable?(File.join(try_ssh_directory_path, 'ssh.exe'))
-      @vagrant_env_path << File::PATH_SEPARATOR + try_ssh_directory_path
-      return
-    end
-  end
+  ssh_path = try_ssh_directory_paths.find { |try_ssh_directory_path| File.executable?(File.join(try_ssh_directory_path, 'ssh.exe')) }
 
+  return @vagrant_env_path << File::PATH_SEPARATOR + ssh_path if ssh_path
 
-  puts 'SSH must be installed and on the PATH.' # TODO recommend an OS-specific source for SSH
+  @logger.user 'SSH must be installed and on the PATH.' # TODO: recommend an OS-specific source for SSH
   exit 1
 end
-ensure_ssh_on_vagrant_path
 
-# TODO report all missing dependencies before exiting for a better user experience
+# TODO: report all missing dependencies before exiting for a better user experience
 
-# TODO test for VirtualBox installation
+# TODO: test for VirtualBox installation
 
-case ARGV[0]
-when "init"
+def init
+  @logger.debug "SECTION_CLI_PATH is '#{SECTION_CLI_PATH}'"
+  @logger.debug "Command line arguments: #{$ARGV}"
+  @logger.debug "Ruby version: #{RUBY_VERSION}-p#{RUBY_PATCHLEVEL}"
 
-  section_init
-
-when "up"
-
-  section_init
-
-  vagrant_execute('up')
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh && sudo /vagrant/bootstrap.sh;'])
-
-when "reload"
-  validate_section_config_json()
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh;'])
-  config = get_local_instance_config()
-  copy_app_repo_to_hiera(config)
-  copy_app_repo_to_volume_source(config)
-
-  app_id = IO.read(APP_ID_FILE)
-
-  #TODO remove this step, local reload should not contact the Internet
-  vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{app_id};"])
-
-  #TODO test the exit codes of the above commands before declaring success
-  puts "section.io proxy stack updated with the latest changes\n"
-
-when "pull"
-
-  git_path = IO.read(REPOSITORY_PATH_FILE)
-  gitCmd = "git pull"
-  puts("[#{git_path}] #{gitCmd}")
-
-when 'status'
-
-  #NOTE: This will be deprecated by working directory context project
-  section_status
-
-
-when 'push'
-
-  if ARGV[1] == nil or ARGV[1] == "" then
-    abort "*** Missing commit message ***\n\nUsage: \n\tsection push \"Commit message\""
+  unless which('vagrant')
+    @logger.user 'Vagrant must be installed and on the PATH. Vagrant can be downloaded at https://www.vagrantup.com/'
+    exit 1
   end
 
-  commit_message = ARGV[1]
-  git_path = IO.read(REPOSITORY_PATH_FILE)
+  ensure_git_valid
+  ensure_ssh_on_vagrant_path
+end
 
-  gitCmd = "git add ."
-  puts("[#{git_path}] #{gitCmd}")
-  system(gitCmd, :chdir => git_path)
+def main
+  case ARGV[0]
+  when 'init'
+    section_init
 
-  gitCmd = "git commit -m \"#{commit_message}\""
-  puts("[#{git_path}] #{gitCmd}")
-  system(gitCmd, :chdir => git_path)
+  when 'up'
+    section_init
 
-  gitCmd = "git push"
-  puts("[#{git_path}] #{gitCmd}")
-  system(gitCmd, :chdir => git_path)
+    vagrant_execute('up')
+    vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh && sudo /vagrant/bootstrap.sh;'])
 
-when 'promote'
-  section_promote
+  when 'reload'
+    section_reload
 
-when '--help'
+  when 'pull'
+    git_path = IO.read(REPOSITORY_PATH_FILE)
+    git_cmd = 'git pull'
+    @logger.user("[#{git_path}] #{git_cmd}")
 
-  display_command_options()
+  when 'status'
+    # NOTE: This will be deprecated by working directory context project
+    section_status
 
-when nil
-  puts "\nERROR: Missing command\n"
-  display_command_options()
-  exit 1
+  when 'push'
+    if ARGV[1].nil? || ARGV[1].empty?
+      abort "*** Missing commit message ***\n\nUsage: \n\tsection push \"Commit message\""
+    end
 
-else
-  puts "\nERROR: Invalid command '#{ARGV[0]}'"
-  display_command_options()
-  exit 1
+    commit_message = ARGV[1]
+    git_path = IO.read(REPOSITORY_PATH_FILE)
+
+    git_cmd = 'git add .'
+    @logger.user("[#{git_path}] #{git_cmd}")
+    system(git_cmd, chdir: git_path)
+
+    git_cmd = "git commit -m \"#{commit_message}\""
+    @logger.user("[#{git_path}] #{git_cmd}")
+    system(git_cmd, chdir: git_path)
+
+    git_cmd = 'git push'
+    @logger.user("[#{git_path}] #{git_cmd}")
+    system(git_cmd, chdir: git_path)
+
+  when 'promote'
+    section_promote
+
+  when 'append'
+    section_append(ARGV[1], ARGV[2])
+
+  when '--help'
+    display_command_options
+
+  when nil
+    @logger.error 'Missing command'
+    display_command_options
+    exit 1
+
+  else
+    @logger.user "\nERROR: Invalid command '#{ARGV[0]}'"
+    display_command_options
+    exit 1
+  end
+end
+
+begin
+  init
+  main
+rescue StandardError => e
+  @logger.fatal "An unhandled exception occurred. Details available in #{@logger.file_name}"
+  @logger.debug "Unhandled exception: #{e.inspect}"
+  @logger.debug "Backtrace: #{e.backtrace.inspect}"
 end
