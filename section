@@ -743,4 +743,3 @@ rescue StandardError => e
   @logger.debug "Unhandled exception: #{e.inspect}"
   @logger.debug "Backtrace: #{e.backtrace.inspect}"
 end
-
