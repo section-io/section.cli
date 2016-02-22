@@ -162,9 +162,7 @@ def section_append(proxy_template_name, proxy_name)
   end
 
   # If proxy_name is invalid show error
-  if proxy_name !~ /^[0-9a-z]+$/i
-    display_append_error "\n*** invalid proxy_name '#{proxy_name}', can only contain letters or numbers ***\n"
-  end
+  display_append_error "\n*** invalid proxy_name '#{proxy_name}', can only contain letters or numbers ***\n" unless valid_proxy_name?(proxy_name)
 
   @logger.debug('Load up the section.config.json and append the new proxy')
   config = load_and_validate_section_config_json
@@ -420,16 +418,28 @@ def update_app_repo_dir(config)
   end
 end
 
+def valid_proxy_name?(proxy_name)
+  proxy_name =~ /^[0-9a-z]+$/i
+end
+
 def load_and_validate_section_config_json
   repo_dir = IO.read(REPOSITORY_PATH_FILE)
   json_file = File.join(repo_dir, 'section.config.json')
   begin
-    JSON.parse(IO.read(json_file))
+    config = JSON.parse(IO.read(json_file))
   rescue JSON::ParserError => err
     error_detail = err.message[0, 80]
     error_detail += '...' if err.message.length > 80
     abort "Error Could not parse JSON file '#{json_file}':\n#{error_detail}"
   end
+
+  invalid_proxy = config['proxychain'].find { |p| !valid_proxy_name? p['name'] }
+  if invalid_proxy
+    @logger.user "\n*** Proxy name '#{invalid_proxy['name']}' in #{json_file} is invalid, proxy names can only contain alphanumeric characters ***"
+    abort
+  end
+
+  config
 end
 
 def update_section_config_json(config)
@@ -509,6 +519,7 @@ def section_init
 
   config = get_instance_config(token)
   update_app_repo_dir(config)
+  load_and_validate_section_config_json
   copy_app_repo_to_hiera(config)
 end
 
