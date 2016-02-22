@@ -154,9 +154,11 @@ def section_append(proxy_template_name, proxy_name)
     abort
   end
 
-  # If no proxy_name provided show error
+  # If no proxy_name default to the proxy image name
   if proxy_name.nil? || proxy_name.empty?
-    display_append_error "\n*** missing proxy_name ***\n"
+    proxy_name = proxy_template_name.split(':')[0]
+    proxy_name = proxy_name.gsub(/[^a-z0-9]/i, '')
+    @logger.debug "Defaulting the new proxy name to #{proxy_name} since one was not provided"
   end
 
   # If proxy_name is invalid show error
@@ -170,7 +172,7 @@ def section_append(proxy_template_name, proxy_name)
   # If proxyname has already been used show error
   # TODO: Check that the name doesn't match reserved folder names like custom_errors
   if config['proxychain'].any? { |p| p['name'] == proxy_name }
-    display_append_error "\n*** invalid proxy_name '#{proxy_name}', a proxy with that name already exists ***\n"
+    display_append_error "\n*** invalid proxy_name '#{proxy_name}', a proxy with that name already exists. Please specify a different name. ***\n"
   end
 
   new_proxy = { name: proxy_name, image: proxy_template['image'] }
@@ -187,7 +189,11 @@ def section_append(proxy_template_name, proxy_name)
   @logger.debug("Extracting initial state into #{initial_state_destination}")
   extract_tar_gzip(initial_state_file, initial_state_destination)
 
-  @logger.user "Proxy #{proxy_name} has been added to your repository, now reloading your local instance to reflect these changes"
+  @logger.user "Proxy #{proxy_name} has been added to your repository, now reloading your local instance to reflect these changes.\n"
+  @logger.user ' ** WARNING ** Currently, automatically pushing a new proxy into your Production hosted environment is not a'
+  @logger.user '               supported action. Pushing this change into your Production environment can cause your proxy'
+  @logger.user '               stack to behave unexpectedly. Once you have tested your new proxy and you would like to deploy'
+  @logger.user '               it, please submit a support request via https://support.section.io/ to get it pushed live.'
   section_reload
 end
 
@@ -242,7 +248,7 @@ def download_proxy_templates_from_api
 end
 
 def display_section_append_usage
-  @logger.user "\nUsage: \n\tsection append <proxy_template_name> <proxy_name>\n\n"
+  @logger.user "\nUsage: \n\tsection append <proxy_template_name>[ <proxy_name>]\n\n"
 end
 
 def display_append_error(message)
