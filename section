@@ -6,7 +6,6 @@ require 'tempfile'
 require 'open-uri'
 require 'rubygems/package'
 require 'json'
-require 'open3'
 require 'stringio'
 
 STDOUT.sync = true
@@ -107,12 +106,15 @@ end
 at_exit { log_exit $ERROR_INFO, $ERROR_POSITION }
 
 @logger = SectionLogger.new
-def aperture_get_http(uri_stem, etag = nil)
-  uri = URI.parse("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}#{uri_stem}")
+def http_get_response(uri, additional_headers = {}, &block)
+  uri = URI.parse(uri)
   @logger.debug "uri to fetch is '#{uri}'"
 
   http = Net::HTTP.new(uri.host, uri.port)
-  if 'https' == APERTURE_SCHEME
+  request = Net::HTTP::Get.new uri.request_uri
+
+  # If a request to aperture via https verify the certificate and send the basic auth header
+  if uri.scheme == 'https' && uri.host == APERTURE_DOMAIN
     http.use_ssl = true
     http.verify_mode = OpenSSL::SSL::VERIFY_PEER
     http.verify_callback = lambda do |_, ssl_context|
@@ -122,19 +124,65 @@ def aperture_get_http(uri_stem, etag = nil)
       return true if thumbprint == SECTION_IO_THUMBPRINT_SHA1_LEGACY
       return false
     end
+
+    request.basic_auth 'section.cli', IO.read(INSTANCE_TOKEN_FILE)
   end
 
-  request = Net::HTTP::Get.new uri.request_uri
   request['User-Agent'] = user_agent
-  request['If-None-Match'] = etag unless etag.nil? || etag.empty?
+  additional_headers.each do |key, value|
+    request[key] = value
+  end
 
-  request.basic_auth 'section.cli', IO.read(INSTANCE_TOKEN_FILE)
-  response = http.request request
-
-  return response.body, response['ETag']
+  http.request request, nil, &block
 end
-SECTION_PROXYTEMPLATE_FILE = File.join(SECTION_DATA_DIR, 'proxy_templates.json')
 
+def get_cache_expiry_date(response)
+  max_age = /max-age=(\d+)/i.match response['Cache-Control'] { |match| match[1].to_i } unless response['Cache-Control'].nil?
+
+  return Time.now + max_age if max_age
+end
+
+def http_download_file(uri, destination_path, destination_file_type = 't')
+  response_status = nil
+  additional_headers = {}
+
+  # Send the If-None-Match header if there is an .etag file for the file
+  etag_file_path = "#{destination_path}.etag"
+  cached_etag = IO.read(etag_file_path) if File.exist?(etag_file_path)
+  additional_headers['If-None-Match'] = cached_etag unless cached_etag.nil? || cached_etag.empty? || !File.exist?(destination_path)
+
+  # Check the cache file expiry date against now
+  expiry_file_path = "#{destination_path}.expiry"
+  cached_expiry = Time.parse(IO.read(expiry_file_path)) if File.exist?(expiry_file_path)
+  unless cached_expiry.nil? || Time.now > cached_expiry || !File.exist?(destination_path)
+    @logger.debug "Not downloading due to existing cache not expired, cache expires #{cached_expiry}"
+    return response_status
+  end
+
+  http_get_response uri, additional_headers do |response|
+    response_status = response.code
+    if response.is_a?(Net::HTTPSuccess)
+      File.open(etag_file_path, 'w+') { |f| f.write(response['ETag']) } unless response['ETag'].nil?
+      cached_expiry = get_cache_expiry_date(response)
+      File.open(expiry_file_path, 'w+') { |f| f.write(cached_expiry) } unless cached_expiry.nil?
+
+      @logger.debug "Writing download to #{destination_path}"
+      file_mode = "w#{destination_file_type}"
+      File.open(destination_path, file_mode) do |cache_file|
+        response.read_body do |segment|
+          cache_file.write(segment)
+        end
+      end
+    end
+  end
+
+  response_status
+end
+
+def http_download_string(uri)
+  response = http_get_response uri
+  response.body
+end
 def section_append(proxy_template_name, proxy_name)
   # Get the available proxytemplate list
   proxy_templates = load_proxy_templates
@@ -178,8 +226,8 @@ def section_append(proxy_template_name, proxy_name)
   update_section_config_json(config)
 
   @logger.debug("Downloading inital proxy state files for #{proxy_template_name}")
-  initial_state_api_uri = "/api/v1/proxytemplate/initialstate?proxyTemplateName=#{URI.escape(proxy_template_name)}"
-  initial_state_file_string, _etag = aperture_get_http(initial_state_api_uri)
+  initial_state_api_uri = "#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/api/v1/proxytemplate/initialstate?proxyTemplateName=#{URI.escape(proxy_template_name)}"
+  initial_state_file_string = http_download_string initial_state_api_uri
   initial_state_file = StringIO.new initial_state_file_string
 
   repo_dir = IO.read(REPOSITORY_PATH_FILE)
@@ -193,56 +241,6 @@ def section_append(proxy_template_name, proxy_name)
   @logger.user '               stack to behave unexpectedly. Once you have tested your new proxy and you would like to deploy'
   @logger.user '               it, please submit a support request via https://support.section.io/ to get it pushed live.'
   section_reload
-end
-
-def load_proxy_templates
-  @logger.debug 'Loading proxy template list'
-
-  download_proxy_templates_from_api
-
-  @logger.debug "Checking proxy template list cache file '#{SECTION_PROXYTEMPLATE_FILE}'"
-  if File.exist?(SECTION_PROXYTEMPLATE_FILE)
-    templates_str = IO.read(SECTION_PROXYTEMPLATE_FILE)
-  end
-
-  if templates_str.nil? || templates_str.empty?
-    @logger.error('Unable to load proxy template list, no local cache available')
-    abort
-  end
-
-  # JSON parse API respone
-  begin
-    JSON.parse(templates_str)
-  rescue JSON::ParserError => err
-    error_detail = err.message[0, 80]
-    error_detail += '...' if err.message.length > 80
-    @logger.error "Could not fetch proxytemplate list JSON file:\n#{error_detail}"
-    abort
-  end
-end
-
-def download_proxy_templates_from_api
-  @logger.debug 'Loading proxy template list from API'
-
-  if File.exist?("#{SECTION_PROXYTEMPLATE_FILE}.etag")
-    etag = IO.read("#{SECTION_PROXYTEMPLATE_FILE}.etag")
-  end
-
-  # Catch http fetch errors because the local cache can be used if it's available
-  begin
-    templates_str, etag = aperture_get_http('/api/v1/proxytemplate', etag)
-  rescue StandardError => err
-    @logger.warn("Unable to load proxy templates from API: #{err.message}")
-  end
-
-  if !templates_str.nil? && !templates_str.empty?
-    File.open(SECTION_PROXYTEMPLATE_FILE, 'w+') { |f| f.write(templates_str) }
-
-    # Write the etag to a file for checking next time we load this
-    if !etag.nil? && !etag.empty?
-      File.open("#{SECTION_PROXYTEMPLATE_FILE}.etag", 'w+') { |f| f.write(etag) }
-    end
-  end
 end
 
 def display_section_append_usage
@@ -262,7 +260,10 @@ def display_section_append_available_templates(proxy_templates)
   end
 end
 def extract_tar_gzip(source, destination)
-  Gem::Package::TarReader.new(Zlib::GzipReader.new(source)) do |tar|
+  # If the source is a string, treat it as a path to a local file
+  gzip_reader = source.instance_of?(String) ? Zlib::GzipReader.open(source) : Zlib::GzipReader.new(source)
+
+  Gem::Package::TarReader.new(gzip_reader) do |tar|
     dest = nil
     tar.each do |entry|
       if entry.full_name == TAR_LONGLINK
@@ -286,6 +287,59 @@ def extract_tar_gzip(source, destination)
       dest = nil
     end
   end
+end
+SECTION_PROXYTEMPLATE_FILE = File.join(SECTION_DATA_DIR, 'proxy_templates.json')
+LEGACY_IMAGE_NAMES = ['varnish']
+
+def download_proxy_templates_from_api
+  # Catch http fetch errors because the local cache can be used if it's available
+  http_download_file "#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/api/v1/proxytemplate", SECTION_PROXYTEMPLATE_FILE
+rescue StandardError => err
+  @logger.warn("Unable to load proxy templates from API: #{err.message}")
+end
+
+def load_proxy_templates
+  @logger.debug 'Loading proxy template list'
+
+  download_proxy_templates_from_api
+
+  @logger.debug "Checking proxy template list cache file '#{SECTION_PROXYTEMPLATE_FILE}'"
+  templates_str = IO.read(SECTION_PROXYTEMPLATE_FILE) if File.exist?(SECTION_PROXYTEMPLATE_FILE)
+
+  if templates_str.nil? || templates_str.empty?
+    @logger.error('Unable to load proxy template list, no local cache available')
+    abort
+  end
+
+  # JSON parse API respone
+  begin
+    JSON.parse(templates_str)
+  rescue JSON::ParserError => err
+    error_detail = err.message[0, 80]
+    error_detail += '...' if err.message.length > 80
+    @logger.error "Could not fetch proxytemplate list JSON file:\n#{error_detail}"
+    abort
+  end
+end
+
+def valid_proxy_chain?(config, json_file)
+  invalid_proxy = config['proxychain'].find { |p| p['name'] !~ /^[0-9a-z]+$/i }
+  if invalid_proxy
+    @logger.error "Proxy name '#{invalid_proxy['name']}' is invalid in #{json_file}, proxy names can only contain alphanumeric characters"
+    return false
+  end
+
+  proxy_templates = load_proxy_templates
+  public_image_names = proxy_templates.map { |t| t['image'] }.uniq
+  valid_image_names = public_image_names + LEGACY_IMAGE_NAMES
+  invalid_proxy = config['proxychain'].find { |p| !valid_image_names.include?(p['image']) }
+  if invalid_proxy
+    @logger.error "Image '#{invalid_proxy['image']}' for proxy name '#{invalid_proxy['name']}' is not a valid image name in #{json_file}"
+    @logger.user "       Valid images names are: #{public_image_names.join(', ')}"
+    return false
+  end
+
+  true
 end
 
 def display_command_options
@@ -323,7 +377,7 @@ def user_agent
 end
 
 def get_instance_config(token)
-  config_str, _etag = aperture_get_http("/instance/getconfig?token=#{token}")
+  config_str = http_download_string("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
   File.open(INSTANCE_CONFIG_FILE, 'w+') { |f| f.write(config_str) }
   JSON.parse(config_str)
 end
@@ -358,15 +412,21 @@ def which(cmd)
 end
 
 def download_latest_vagrant_if_needed
-  @logger.user "Downloading latest vagrant files to #{VAGRANT_PATH}"
+  @logger.user 'Checking for latest vagrant files'
 
   uri = URI.parse(SECTION_TARBALL_URL)
+  file_name = File.basename(uri.path)
+  unzip_destination = SECTION_CLI_PATH
+  cache_file_path = File.join(SECTION_DATA_DIR, file_name)
 
-  destination = SECTION_CLI_PATH
+  response_status = http_download_file SECTION_TARBALL_URL, cache_file_path, 'b'
 
-  source = open(uri)
-
-  extract_tar_gzip(source, destination)
+  if response_status == '200'
+    @logger.debug("Extracting #{cache_file_path} to #{unzip_destination}")
+    extract_tar_gzip(cache_file_path, unzip_destination)
+  else
+    @logger.debug "Not extracting #{cache_file_path} since http request returned a #{response_status || 'nil'} response code"
+  end
 end
 
 def update_app_repo_dir(config)
@@ -376,7 +436,7 @@ def update_app_repo_dir(config)
     application_config = config['accounts'][0]['applications'][index]
     environment_config = application_config['environments'][0]
     application_name = application_config['name']
-    $stdout.write "Processing application: #{application_name}\n"
+    @logger.user "Processing application: #{application_name}"
     file_friendly_app_name = application_name.gsub(/[^a-z0-9_\.\-]+/, '_').downcase
     app_directory = File.join(APPS_PATH, file_friendly_app_name)
     section_config_json_file = File.join(app_directory, 'section.config.json')
@@ -391,12 +451,12 @@ def update_app_repo_dir(config)
     if Dir.exist?(app_directory)
       if File.exist?(section_config_json_file)
         # Leave it in intact
-        $stdout.write "Repository exists and will not be altered\n"
+        @logger.user 'Repository exists and will not be altered'
       else
         abort "Unknown state, cannot continue. Missing file #{section_config_json_file}"
       end
     else
-      $stdout.write "Creating repository\n"
+      @logger.user 'Creating repository'
       FileUtils.mkdir_p app_directory
       git_cmd = "git clone \"#{application_config['repository']}\" #{file_friendly_app_name}"
       clone_succeeded = cmd_execute_interactive(APPS_PATH, git_cmd)
@@ -418,10 +478,6 @@ def update_app_repo_dir(config)
   end
 end
 
-def valid_proxy_name?(proxy_name)
-  proxy_name =~ /^[0-9a-z]+$/i
-end
-
 def load_and_validate_section_config_json
   repo_dir = IO.read(REPOSITORY_PATH_FILE)
   json_file = File.join(repo_dir, 'section.config.json')
@@ -433,11 +489,7 @@ def load_and_validate_section_config_json
     abort "Error Could not parse JSON file '#{json_file}':\n#{error_detail}"
   end
 
-  invalid_proxy = config['proxychain'].find { |p| !valid_proxy_name? p['name'] }
-  if invalid_proxy
-    @logger.user "\n*** Proxy name '#{invalid_proxy['name']}' in #{json_file} is invalid, proxy names can only contain alphanumeric characters ***"
-    abort
-  end
+  abort unless valid_proxy_chain?(config, json_file)
 
   config
 end
@@ -463,7 +515,7 @@ def copy_app_repo_to_hiera(config)
   config['accounts'][0]['applications'].each do |application_config|
     source_dir = IO.read("#{REPOSITORY_PATH_FILE}.app.#{application_config['application_id']}")
     dest_dir = File.join(REPOSITORIES_DIR, get_repo_dirname(application_config['application_id'], application_config['environments'][0]['environment_id']))
-    @logger.debug "Copying #{source_dir} to #{dest_dir}\n"
+    @logger.debug "Copying #{source_dir} to #{dest_dir}"
     FileUtils.mkdir_p dest_dir
     FileUtils.cp_r(File.join(source_dir, '.'), dest_dir, remove_destination: true)
   end
@@ -494,7 +546,7 @@ def section_init
   @logger.debug "Environment-overridden value for update_section_cli_now is #{update_section_cli_now}"
   if update_section_cli_now
     exit_status, = cmd_execute(SECTION_CLI_PATH, 'git pull')
-    $stderr.write "Warning: could not check for update to latest version of section.cli\n" unless exit_status == 0
+    @logger.warn 'Warning: could not check for update to latest version of section.cli' unless exit_status == 0
     FileUtils.touch SECTION_CLI_UPDATE_FILE
   end
 
@@ -510,10 +562,9 @@ def section_init
     File.open(INSTANCE_TOKEN_FILE, 'w+') { |f| f.write(ARGV[1]) }
   elsif File.exist?(INSTANCE_TOKEN_FILE)
     token = IO.read(INSTANCE_TOKEN_FILE)
-    @logger.user "Running with existing token '#{token}'\n"
+    @logger.user "Running with existing token '#{token}'"
   else
-    $stderr.write "Error: Please provide your instance token as a parameter\n"
-    $stderr.write "ie. \n\tsection up <token>\n\n"
+    @logger.error "Please provide your instance token as a parameter\nie. \n\tsection up <token>"
     abort "You can obtain the instance token by logging in to aperture.section.io and selecting the instance you are trying to launch\n"
   end
 
@@ -522,6 +573,8 @@ def section_init
   load_and_validate_section_config_json
   copy_app_repo_to_hiera(config)
 end
+
+require 'open3'
 
 def cmd_execute(path, cmd)
   Open3.popen3(cmd, chdir: path) do |_, stdout, stderr, wait_thr|
@@ -543,17 +596,78 @@ def cmd_execute_interactive(path, cmd)
   system(cmd, chdir: path)
 end
 
+require 'open3'
+
+# Error for vagrant_execute
+class VagrantExecuteError < StandardError
+  attr_reader :stdout
+  attr_reader :stderr
+  attr_reader :exit_status
+
+  def initialize(msg, stdout, stderr, exit_status)
+    @stdout = stdout
+    @stderr = stderr
+    @exit_status = exit_status
+    super(msg)
+  end
+end
+
 def vagrant_execute(subcommand, args = [])
   @logger.debug "Running Vagrant #{subcommand} with args: #{args}"
-  all_args = [subcommand].concat(args)
-  system({ 'PATH' => @vagrant_env_path }, 'vagrant', *all_args, chdir: VAGRANT_PATH)
+  all_args = ['vagrant', subcommand].concat(args)
+
+  stdin, stdout, stderr, wait_thr = Open3.popen3({ 'PATH' => @vagrant_env_path }, *all_args, chdir: VAGRANT_PATH)
+
+  pid = wait_thr[:pid] # pid of the started process
+  @logger.debug "pid: #{pid}"
+  stdout_lines = []
+  stderr_lines = []
+
+  stdout.each do |line|
+    @logger.debug "stdout: #{line.rstrip}"
+    stdout_lines.push(line)
+  end
+
+  stderr.each do |line|
+    @logger.debug "stderr: #{line.rstrip}"
+    stderr_lines.push(line)
+  end
+
+  # wait_thr.value waits the termination of the process
+  process_status = wait_thr.value # Process::Status object returned
+  exit_status = process_status.exitstatus
+
+  stdout_result = stdout.read.chomp
+  stderr_result = stderr.read.chomp
+
+  unless stderr_result.empty?
+    @logger.debug "stdout: #{stdout_result.rstrip}"
+    stdout_lines.push(stdout_result)
+  end
+
+  unless stderr_result.empty?
+    @logger.debug "stderr: #{stderr_result.rstrip}"
+    stderr_lines.push(stderr_result)
+  end
+
+  # stdin, stdout and stderr must be closed explicitly in this form
+  stdin.close
+  stdout.close
+  stderr.close
+
+  @logger.debug "exit_status: #{exit_status}"
+
+  # Any non-zero exit is unexpected
+  raise VagrantExecuteError.new('Unexpected non-zero return value', stdout_lines, stderr_lines, exit_status) unless exit_status == 0
+
+  exit_status
 end
 
 def branch_name
   repo_path = IO.read(REPOSITORY_PATH_FILE)
 
   exit_status, stdout, = cmd_execute(repo_path, 'git rev-parse --abbrev-ref HEAD')
-  abort 'Could\'t check for clean git working copy' unless exit_status == 0
+  abort 'Couldn\'t check for clean git working copy' unless exit_status == 0
   abort 'Couldn\'t determine current HEAD' if stdout.empty?
   stdout
 end
@@ -618,7 +732,7 @@ def section_reload
   vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{app_id};"])
 
   # TODO: test the exit codes of the above commands before declaring success
-  @logger.user "section.io proxy stack updated with the latest changes\n"
+  @logger.user 'section.io proxy stack updated with the latest changes'
 end
 
 def ensure_git_valid
@@ -690,7 +804,9 @@ def main
   when 'up'
     section_init
 
+    @logger.user 'Starting virtual machine if required'
     vagrant_execute('up')
+    @logger.user 'Configuring virtual machine'
     vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh && sudo /vagrant/bootstrap.sh;'])
 
   when 'reload'
@@ -700,6 +816,7 @@ def main
     git_path = IO.read(REPOSITORY_PATH_FILE)
     git_cmd = 'git pull'
     @logger.user("[#{git_path}] #{git_cmd}")
+    system(git_cmd, chdir: git_path)
 
   when 'status'
     # NOTE: This will be deprecated by working directory context project
@@ -740,7 +857,7 @@ def main
     exit 1
 
   else
-    @logger.user "\nERROR: Invalid command '#{ARGV[0]}'"
+    @logger.error "Invalid command '#{ARGV[0]}'"
     display_command_options
     exit 1
   end
@@ -750,6 +867,11 @@ begin
   init
   main
 rescue StandardError => e
+
+  if e.is_a?(VagrantExecuteError) && e.stderr.any? { |l| l.include?('VM must be running to open SSH connection.') }
+    @logger.user "It looks like the virtual machine isn't running. Have you run 'section up' first?"
+  end
+
   @logger.fatal "An unhandled exception occurred. Details available in #{@logger.file_name}"
   @logger.debug "Unhandled exception: #{e.inspect}"
   @logger.debug "Backtrace: #{e.backtrace.inspect}"
