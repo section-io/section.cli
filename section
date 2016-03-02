@@ -409,6 +409,7 @@ def which(cmd)
       return exe if File.executable?(exe) && !File.directory?(exe)
     end
   end
+  return nil
 end
 
 def download_latest_vagrant_if_needed
