@@ -10,6 +10,8 @@ require 'stringio'
 
 STDOUT.sync = true
 
+OpenSSL::SSL::SSLContext::DEFAULT_PARAMS[:ssl_version] = :TLSv1_2
+
 TAR_LONGLINK = '././@LongLink'.freeze
 
 SECTION_CLI_PATH = File.expand_path(File.dirname(__FILE__))
@@ -404,10 +406,10 @@ end
 def which(cmd)
   exts = ENV['PATHEXT'] ? ENV['PATHEXT'].split(';') : ['']
   ENV['PATH'].split(File::PATH_SEPARATOR).each do |path|
-    exts.each do |ext|
+    exts.each { |ext|
       exe = File.join(path, "#{cmd}#{ext}")
       return exe if File.executable?(exe) && !File.directory?(exe)
-    end
+    }
   end
   return nil
 end
@@ -615,6 +617,7 @@ end
 
 def vagrant_execute(subcommand, args = [])
   @logger.debug "Running Vagrant #{subcommand} with args: #{args}"
+  @logger.debug "Overriding PATH for Vagrant: #{@vagrant_env_path}"
   all_args = ['vagrant', subcommand].concat(args)
 
   stdin, stdout, stderr, wait_thr = Open3.popen3({ 'PATH' => @vagrant_env_path }, *all_args, chdir: VAGRANT_PATH)
