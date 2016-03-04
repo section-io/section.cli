@@ -291,7 +291,7 @@ def extract_tar_gzip(source, destination)
   end
 end
 SECTION_PROXYTEMPLATE_FILE = File.join(SECTION_DATA_DIR, 'proxy_templates.json')
-LEGACY_IMAGE_NAMES = ['varnish']
+LEGACY_IMAGE_NAMES = ['varnish', 'varnish-4.0.3', 'varnish3', 'varnish3magento', 'varnish305vmods', 'modsecurity']
 
 def download_proxy_templates_from_api
   # Catch http fetch errors because the local cache can be used if it's available
