@@ -291,7 +291,7 @@ def extract_tar_gzip(source, destination)
   end
 end
 SECTION_PROXYTEMPLATE_FILE = File.join(SECTION_DATA_DIR, 'proxy_templates.json')
-LEGACY_IMAGE_NAMES = ['varnish', 'varnish-4.0.3', 'varnish3', 'varnish3magento', 'varnish305vmods', 'modsecurity']
+LEGACY_IMAGE_NAMES = ['varnish', 'varnish-4.0.3', 'varnish3', 'varnish3magento', 'varnish305vmods', 'modsecurity'].freeze
 
 def download_proxy_templates_from_api
   # Catch http fetch errors because the local cache can be used if it's available
@@ -542,6 +542,8 @@ end
 
 def section_init
   # update section cli if not attempted for more than an hour, or if forced by environment variable
+  _, before_section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
+  @logger.debug "CLI commit hash is #{before_section_commit} before update"
   @logger.debug "SECTION_CLI_UPDATE_FILE is '#{SECTION_CLI_UPDATE_FILE}'"
   update_section_cli_now = !File.exist?(SECTION_CLI_UPDATE_FILE) || File.mtime(SECTION_CLI_UPDATE_FILE) < (Time.now - 60 * 60)
   @logger.debug "File-derived value for update_section_cli_now is #{update_section_cli_now}"
@@ -551,6 +553,12 @@ def section_init
     exit_status, = cmd_execute(SECTION_CLI_PATH, 'git pull')
     @logger.warn 'Warning: could not check for update to latest version of section.cli' unless exit_status == 0
     FileUtils.touch SECTION_CLI_UPDATE_FILE
+    _, after_section_commit = cmd_execute(SECTION_CLI_PATH, 'git rev-parse --short HEAD')
+    @logger.debug "CLI commit hash is #{after_section_commit} after update"
+    if before_section_commit != after_section_commit
+      @logger.user 'The section.io CLI has been updated, please re-run your command'
+      exit 1
+    end
   end
 
   # TODO: Allow a command line arg to force a reload
