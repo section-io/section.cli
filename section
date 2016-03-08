@@ -32,8 +32,10 @@ SECTION_DATA_DIR = File.expand_path('~/.section')
 FileUtils.mkdir_p SECTION_DATA_DIR
 SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 SECTION_TARBALL_URL = ENV['SECTION_TARBALL_URL'] || 'http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz'
+MINIMUM_VAGRANT_VERSION = '1.7.4'.freeze
 $git_executable_path = nil
 $git_version = nil
+$vagrant_version = nil
 
 require 'logger'
 require 'english'
@@ -367,13 +369,13 @@ def user_agent
 
   result += " #{RUBY_ENGINE}/#{RUBY_VERSION} (#{RUBY_PLATFORM})"
 
-  exit_status, vagrant_version = cmd_execute(SECTION_CLI_PATH, 'vagrant --version')
-  if exit_status == 0
-    vagrant_version.sub!(/^vagrant\s*/i, '')
-    result += " vagrant/#{vagrant_version}"
-  end
+  result += " vagrant/#{$vagrant_version}" unless $vagrant_version.nil?
 
-  result + " git/#{$git_version}"
+  result += " git/#{$git_version}"
+
+  @logger.debug "UserAgent: #{result}"
+
+  result
 
   # TODO: SSH version
 end
@@ -802,6 +804,18 @@ def init
   unless which('vagrant')
     @logger.user 'Vagrant must be installed and on the PATH. Vagrant can be downloaded at https://www.vagrantup.com/'
     exit 1
+  end
+
+  exit_status, $vagrant_version = cmd_execute(SECTION_CLI_PATH, 'vagrant --version')
+  $vagrant_version.sub!(/^vagrant\s*/i, '') if exit_status == 0
+
+  unless $vagrant_version.nil?
+    current_vagrant_version = $vagrant_version.split('.').map(&:to_i)
+    required_vagrant_version = MINIMUM_VAGRANT_VERSION.split('.').map(&:to_i)
+    unless (current_vagrant_version <=> required_vagrant_version) >= 0
+      @logger.error "Vagrant version #{MINIMUM_VAGRANT_VERSION} is required, you have version #{$vagrant_version} installed"
+      exit 1
+    end
   end
 
   ensure_git_valid
