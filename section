@@ -37,7 +37,7 @@ $section_commit = nil
 $vagrant_version = nil
 
 require 'logger'
-require 'english'
+require 'English'
 
 # DEBUG < INFO < WARN < ERROR < FATAL < UNKNOWN/ANY
 
