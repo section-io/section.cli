@@ -339,19 +339,30 @@ end
 def section_reload
   current_path_state = load_current_path_state
 
+  @logger.user "Reloading local proxy configuration"
   @logger.debug "Reloading proxy configuration for application #{current_path_state['application_id']}"
 
   load_and_validate_section_config_json
-  vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh;'])
   config = local_instance_config
   copy_app_repo_to_hiera(config)
   copy_app_repo_to_volume_source(config)
 
-  # TODO: remove this step, local reload should not contact the Internet
-  vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{current_path_state['application_id']};"])
+  begin
+    # TODO: remove this step, local reload should not contact the Internet
+    vagrant_execute('ssh', ['-c', "sudo /vagrant/hiera/generate_hiera.sh && sudo /vagrant/run-puppet.sh && sudo /vagrant/update_containers.sh #{current_path_state['application_id']};"])
+  rescue VagrantExecuteError => e
+    @logger.error e
+  end
 
-  # TODO: test the exit codes of the above commands before declaring success
-  @logger.user 'section.io proxy stack updated with the latest changes'
+  _exit_code, stdout, _stderr = vagrant_execute('ssh', ['-c', "sudo /vagrant/validate_containers.sh #{current_path_state['application_id']} #{current_path_state['environment_id']};"])
+  if stdout.length > 0
+    @logger.error "There were errors when validating your proxy configuration:\n"
+    stdout.each do |line|
+      @logger.user "#{line.rstrip}"
+    end
+  else
+    @logger.user 'section.io proxy stack updated with the latest changes'
+  end
 end
 
 def section_diag
@@ -1073,7 +1084,7 @@ def main
     @logger.user 'Starting virtual machine if required'
     vagrant_execute('up')
     @logger.user 'Configuring virtual machine'
-    vagrant_execute('ssh', ['-c', 'sudo /vagrant/remove-appid-only-artifacts.sh && sudo /vagrant/bootstrap.sh;'])
+    vagrant_execute('ssh', ['-c', 'sudo /vagrant/bootstrap.sh;'])
 
   when 'reload'
     section_reload
