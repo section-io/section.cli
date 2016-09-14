@@ -912,7 +912,6 @@ def section_init
 
   load_and_validate_section_config_json repository_path
   copy_app_repo_to_hiera(config)
-  copy_app_repo_to_volume_source(config)
 end
 
 require 'open3'
