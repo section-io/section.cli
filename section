@@ -20,6 +20,7 @@ FileUtils.mkdir_p SECTION_DATA_DIR
 SECTION_CLI_PATH = File.expand_path(File.dirname(__FILE__))
 VAGRANT_PATH = File.join(SECTION_DATA_DIR, 'vagrant')
 INSTANCE_CONFIG_FILE = File.join(VAGRANT_PATH, 'hiera', 'config.json')
+INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
 REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
 APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
 APERTURE_SCHEME = ENV['APERTURE_SCHEME'] || 'https'
@@ -736,6 +737,10 @@ def display_command_options
   puts "\n Submit any support questions to https://support.section.io or support@section.io"
 end
 
+def write_instance_token(token)
+  File.open(INSTANCE_TOKEN_FILE, 'w+') { |f| f.write(token) }
+end
+
 def get_instance_config(token)
   config_str = http_download_string("#{APERTURE_SCHEME}://#{APERTURE_DOMAIN}/instance/getconfig?token=#{token}")
   File.open(INSTANCE_CONFIG_FILE, 'w+') { |f| f.write(config_str) }
@@ -833,11 +838,14 @@ def copy_app_repo_to_volume_source(config)
   ssh_cmd = []
 
   config['accounts'][0]['applications'].each do |application_config|
-    vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', get_repo_dirname(application_config['application_id'], application_config['environments'][0]['environment_id']))
+    repo_dirname = get_repo_dirname(application_config['application_id'], application_config['environments'][0]['environment_id'])
+    vagrant_mapped_repo_path = File.join('/vagrant/hiera/repos/', repo_dirname)
 
-    ssh_cmd.push("sudo rsync -a --delete --delete-during --delete-excluded --exclude .git #{vagrant_mapped_repo_path} #{container_volume_repo_path}")
-
+    #Link the /opt/section.delivery/hiera/repos/<repo> path to the copy in /vagrant
+    ssh_cmd.push("sudo rm --force #{container_volume_repo_path}#{repo_dirname}")
+    ssh_cmd.push("sudo ln --symbolic #{vagrant_mapped_repo_path} #{container_volume_repo_path}#{repo_dirname}")
     ssh_cmd.push("sudo /vagrant/remove-containers-if-proxystack-changed.sh #{application_config['application_id']} #{application_config['environments'][0]['environment_id']}")
+
   end
 
   vagrant_execute('ssh', ['-c', ssh_cmd.join(' && ')])
@@ -893,6 +901,8 @@ def section_init
     @logger.user "Running with existing token '#{$token}'"
   end
 
+  write_instance_token($token)
+
   # Load the config from aperture and clone any missing repositories
   config = get_instance_config($token)
   new_state, primary_app_path = update_app_repo_dir(config, repository_parent_path)
@@ -902,6 +912,7 @@ def section_init
 
   load_and_validate_section_config_json repository_path
   copy_app_repo_to_hiera(config)
+  copy_app_repo_to_volume_source(config)
 end
 
 require 'open3'
