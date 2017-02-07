@@ -24,9 +24,11 @@ INSTANCE_TOKEN_FILE = File.join(VAGRANT_PATH, 'hiera', 'instance_token')
 REPOSITORIES_DIR = File.join(VAGRANT_PATH, 'hiera', 'repos')
 APERTURE_DOMAIN = ENV['APERTURE_DOMAIN'] || 'aperture.section.io'
 APERTURE_SCHEME = ENV['APERTURE_SCHEME'] || 'https'
-SECTION_IO_THUMBPRINT_SHA1 = 'dcf837d21228e3e4c9a4293aabbf1d14e4d6c01a'.freeze
-SECTION_IO_THUMBPRINT_SHA1_LEGACY = '0dea50cf4cfd5d9c031e265106214065f0d3f7b3'
-                                    .freeze
+
+# openssl x509 -fingerprint -noout -in cert.pem | cut -d= -f2 | sed 's/://g' | tr A-F a-f
+SECTION_IO_THUMBPRINT_SHA1 = 'e5508444f3c0f1e4c648203cd3faa74249fab390'.freeze
+SECTION_IO_THUMBPRINT_SHA1_LEGACY = 'dcf837d21228e3e4c9a4293aabbf1d14e4d6c01a'.freeze
+
 SECTION_CLI_UPDATE_FILE = File.join(SECTION_DATA_DIR, 'last-update')
 SECTION_TARBALL_URL = ENV['SECTION_TARBALL_URL'] || 'http://s3-ap-southeast-2.amazonaws.com/section/section-delivery/localdev.tar.gz'
 RUBY = File.join(RbConfig::CONFIG['bindir'], RbConfig::CONFIG['ruby_install_name'])
